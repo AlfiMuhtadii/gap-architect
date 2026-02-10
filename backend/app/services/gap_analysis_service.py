@@ -49,6 +49,16 @@ def _build_result_out(result: GapResult | None) -> GapResultOut | None:
     )
 
 
+def _user_message_from_status(status: GapAnalysisStatus, error_message: str | None) -> str | None:
+    if status == GapAnalysisStatus.FAILED_VALIDATION:
+        return "AI response invalid. Please retry."
+    if status == GapAnalysisStatus.FAILED_LLM:
+        if error_message and "rate_limited" in error_message:
+            return "AI rate limited. Please retry in a moment."
+        return "AI processing failed. Please retry."
+    return None
+
+
 async def create_or_get_gap_analysis(
     session: AsyncSession,
     payload: GapAnalysisCreate,
@@ -72,10 +82,18 @@ async def create_or_get_gap_analysis(
             id=existing.id,
             status=existing.status,
             result=_build_result_out(existing.gap_result),
+            error_message=existing.error_message,
+            user_message=_user_message_from_status(existing.status, existing.error_message),
         )
 
     if existing and existing.status == GapAnalysisStatus.PENDING:
-        return GapAnalysisOut(id=existing.id, status=existing.status, result=None)
+        return GapAnalysisOut(
+            id=existing.id,
+            status=existing.status,
+            result=None,
+            error_message=existing.error_message,
+            user_message=_user_message_from_status(existing.status, existing.error_message),
+        )
 
     if existing and existing.status in (GapAnalysisStatus.FAILED_LLM, GapAnalysisStatus.FAILED_VALIDATION):
         existing.status = GapAnalysisStatus.PENDING
@@ -107,9 +125,17 @@ async def create_or_get_gap_analysis(
                 id=existing.id,
                 status=existing.status,
                 result=_build_result_out(existing.gap_result),
+                error_message=existing.error_message,
+                user_message=_user_message_from_status(existing.status, existing.error_message),
             )
         if existing:
-            return GapAnalysisOut(id=existing.id, status=existing.status, result=None)
+            return GapAnalysisOut(
+                id=existing.id,
+                status=existing.status,
+                result=None,
+                error_message=existing.error_message,
+                user_message=_user_message_from_status(existing.status, existing.error_message),
+            )
         raise
     await session.refresh(gap_analysis)
 
@@ -118,7 +144,13 @@ async def create_or_get_gap_analysis(
     else:
         await llm_service.process_gap_analysis(gap_analysis.id)
 
-    return GapAnalysisOut(id=gap_analysis.id, status=gap_analysis.status, result=None)
+    return GapAnalysisOut(
+        id=gap_analysis.id,
+        status=gap_analysis.status,
+        result=None,
+        error_message=gap_analysis.error_message,
+        user_message=_user_message_from_status(gap_analysis.status, gap_analysis.error_message),
+    )
 
 
 async def get_gap_analysis(session: AsyncSession, gap_analysis_id: UUID) -> GapAnalysisOut | None:
@@ -150,4 +182,10 @@ async def get_gap_analysis(session: AsyncSession, gap_analysis_id: UUID) -> GapA
         if isinstance(result, GapResult)
         else None
     )
-    return GapAnalysisOut(id=analysis.id, status=analysis.status, result=result_out)
+    return GapAnalysisOut(
+        id=analysis.id,
+        status=analysis.status,
+        result=result_out,
+        error_message=analysis.error_message,
+        user_message=_user_message_from_status(analysis.status, analysis.error_message),
+    )

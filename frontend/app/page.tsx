@@ -24,11 +24,13 @@ type GapResult = {
   match_reason: string;
 };
 
-type GapAnalysisResponse = {
-  id: string;
-  status: "PENDING" | "DONE" | "FAILED_VALIDATION" | "FAILED_LLM";
-  result?: GapResult | null;
-};
+  type GapAnalysisResponse = {
+    id: string;
+    status: "PENDING" | "DONE" | "FAILED_VALIDATION" | "FAILED_LLM";
+    result?: GapResult | null;
+    error_message?: string | null;
+    user_message?: string | null;
+  };
 type OccupationSuggestion = {
   concept_uri: string;
   preferred_label: string;
@@ -46,6 +48,7 @@ export default function HomePage() {
   const [analysisId, setAnalysisId] = useState<string | null>(null);
   const [lookupId, setLookupId] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [userMessage, setUserMessage] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [jdSkills, setJdSkills] = useState<string[]>([]);
   const [resumeSkills, setResumeSkills] = useState<string[]>([]);
@@ -57,6 +60,7 @@ export default function HomePage() {
     const data = await apiGet<GapAnalysisResponse>(`/api/v1/gap-analyses/${id}`);
     setStatus(data.status);
     setResult(data.result ?? null);
+    setUserMessage(data.user_message ?? null);
     return data.status;
   }, []);
 
@@ -76,6 +80,7 @@ export default function HomePage() {
 
   const onSubmit = async () => {
     setError(null);
+    setUserMessage(null);
     setResult(null);
     setStatus(null);
     setIsSubmitting(true);
@@ -90,6 +95,7 @@ export default function HomePage() {
       setAnalysisId(data.id);
       setStatus(data.status);
       setResult(data.result ?? null);
+      setUserMessage(data.user_message ?? null);
       setIsSubmitting(false);
       apiPost<{ suggestions: OccupationSuggestion[] }>(
         "/api/v1/gap-analyses/suggest-occupations",
@@ -105,12 +111,14 @@ export default function HomePage() {
 
   const onLookup = async () => {
     setError(null);
+    setUserMessage(null);
     if (!lookupId.trim()) return;
     try {
       const data = await apiGet<GapAnalysisResponse>(`/api/v1/gap-analyses/${lookupId.trim()}`);
       setAnalysisId(data.id);
       setStatus(data.status);
       setResult(data.result ?? null);
+      setUserMessage(data.user_message ?? null);
     } catch (e) {
       setError("Analysis ID not found");
     }
@@ -118,6 +126,7 @@ export default function HomePage() {
 
   const onDetectSkills = async () => {
     setError(null);
+    setUserMessage(null);
     try {
       const data = await apiPost<{ jd_skills: string[]; resume_skills: string[] }>(
         "/api/v1/gap-analyses/detect-skills",
@@ -397,6 +406,9 @@ export default function HomePage() {
         </div>
 
         {error && <div className="text-sm text-[var(--danger)]">{error}</div>}
+        {userMessage && (
+          <div className="text-sm text-[var(--danger)]">{userMessage}</div>
+        )}
       </section>
 
       {result && (

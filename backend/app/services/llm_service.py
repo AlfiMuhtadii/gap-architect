@@ -288,6 +288,11 @@ class HeuristicProvider:
 async def _translate_text(text: str, provider: LlmProvider) -> str:
     if not text.strip():
         return text
+    # Enforce input size to avoid malformed LLM output on truncation
+    max_chars = settings.max_prompt_chars
+    if len(resume_text) > max_chars or len(jd_text) > max_chars:
+        raise ValueError("input_too_long")
+
     prompt = (
         "Translate the following text to English. Preserve technical terms and proper nouns. "
         "Return ONLY the translated text.\n\n"
@@ -449,14 +454,6 @@ def _build_prompt(
         f"JD_TEXT:\n{jd_text}{override_text}"
     )
 
-    # Token-safety truncation
-    if len(prompt) > settings.max_prompt_chars:
-        logger.warning(
-            "prompt_truncated",
-            extra={"len": len(prompt), "max": settings.max_prompt_chars},
-        )
-        prompt = prompt[: settings.max_prompt_chars]
-
     return prompt
 
 
@@ -483,6 +480,11 @@ async def process_gap_analysis(gap_analysis_id) -> None:
         resume_text = analysis.resume_text
         jd_text = analysis.jd_text
         try:
+            max_chars = settings.max_prompt_chars
+            if len(resume_text) + len(jd_text) > max_chars:
+                fallback = HeuristicProvider()
+                await run_gap_analysis_ai(session, analysis.id, fallback, _build_prompt(resume_text[:max_chars], jd_text[:max_chars], analysis.jd_skills_override if isinstance(analysis.jd_skills_override, list) else None))
+                return
             if settings.translate_enabled:
                 resume_text = await _translate_text(resume_text, provider)
                 jd_text = await _translate_text(jd_text, provider)
@@ -495,6 +497,10 @@ async def process_gap_analysis(gap_analysis_id) -> None:
             )
             await run_gap_analysis_ai(session, analysis.id, provider, prompt)
         except ValueError as exc:
+            if "input_too_long" in str(exc):
+                fallback = HeuristicProvider()
+                await run_gap_analysis_ai(session, analysis.id, fallback, prompt)
+                return
             if "Translation resulted in empty text" in str(exc):
                 analysis.status = GapAnalysisStatus.FAILED_VALIDATION
                 analysis.error_message = str(exc)[:1000]

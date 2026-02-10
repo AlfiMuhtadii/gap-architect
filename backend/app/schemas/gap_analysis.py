@@ -80,6 +80,8 @@ class GapAnalysisOut(BaseModel):
     id: UUID
     status: GapAnalysisStatus
     result: GapResultOut | None = None
+    error_message: str | None = None
+    user_message: str | None = None
 
     class Config:
         from_attributes = True

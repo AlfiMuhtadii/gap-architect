@@ -665,6 +665,17 @@ async def run_gap_analysis_ai(
                 try:
                     validated = GapAnalysisAIResult.model_validate(parsed)
                 except ValidationError as exc_local:
+                    await _log_llm_run(
+                        session=session,
+                        gap_analysis_id=gap_analysis_id,
+                        provider=provider.name,
+                        model=provider.model,
+                        request_hash=_hash_prompt(prompt),
+                        response_json=parsed if isinstance(parsed, dict) else {"raw": parsed},
+                        status=LlmRunStatus.FAILED,
+                        error_message=str(exc_local),
+                        duration_ms=duration_ms,
+                    )
                     raise ValueError("local_invalid_json") from exc_local
             repaired_prompt = _repair_prompt(prompt, json.dumps(parsed, ensure_ascii=True), str(exc))
             parsed2, error2, duration_ms = await _call_llm(repaired_prompt)
@@ -686,6 +697,17 @@ async def run_gap_analysis_ai(
                 validated = GapAnalysisAIResult.model_validate(parsed2)
                 parsed = parsed2
             except ValidationError as exc2:
+                await _log_llm_run(
+                    session=session,
+                    gap_analysis_id=gap_analysis_id,
+                    provider=provider.name,
+                    model=provider.model,
+                    request_hash=_hash_prompt(repaired_prompt),
+                    response_json=parsed2 if isinstance(parsed2, dict) else {"raw": parsed2},
+                    status=LlmRunStatus.FAILED,
+                    error_message=str(exc2),
+                    duration_ms=duration_ms,
+                )
                 await _mark_failed_validation(session, analysis, str(exc2))
                 return
         await _log_llm_run(
