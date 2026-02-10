@@ -327,6 +327,10 @@ def _filter_missing_against_jd_and_resume(
 def _validate_roadmap_markdown(text: str) -> None:
     import re
 
+    # Normalize unicode dashes and whitespace
+    text = text.replace("\u2013", "-").replace("\u2014", "-").replace("\u2212", "-")
+    text = "\n".join(line.rstrip() for line in text.splitlines())
+
     # Normalize common heading variants from LLMs
     if "# Gap Summary" in text and "## Gap Summary" not in text:
         text = text.replace("# Gap Summary", "## Gap Summary", 1)
@@ -354,6 +358,15 @@ def _validate_roadmap_markdown(text: str) -> None:
         positions.append(idx)
     if positions != sorted(positions):
         raise ValueError("roadmap_markdown headings out of order")
+
+    # Fail fast on empty sections
+    for i, heading in enumerate(required_headings):
+        next_heading = required_headings[i + 1] if i + 1 < len(required_headings) else None
+        section = text.split(heading, 1)[1]
+        if next_heading:
+            section = section.split(next_heading, 1)[0]
+        if not section.strip():
+            raise ValueError(f"roadmap_markdown section empty: {heading}")
 
 
     def _section_slice(start: str, end: str | None) -> str:
