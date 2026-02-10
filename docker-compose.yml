@@ -1,0 +1,63 @@
+version: "3.9"
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: gap_architect
+      POSTGRES_USER: gap
+      POSTGRES_PASSWORD: gap
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ./backend
+    environment:
+      APP_ENV: development
+      APP_NAME: gap-architect
+      API_V1_STR: /api/v1
+      DEBUG: "true"
+      DATABASE_URL: postgresql+psycopg://gap:gap@postgres:5432/gap_architect
+      LOCAL_LLM_BASE_URL: http://ollama:11434
+      LOCAL_LLM_MODEL: llama3.1
+    depends_on:
+      - postgres
+      - ollama
+      - ollama-init
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      NEXT_PUBLIC_API_BASE: http://localhost:8000
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
+
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama:/root/.ollama
+    ports:
+      - "11434:11434"
+    restart: unless-stopped
+    environment:
+      - OLLAMA_HOST=0.0.0.0
+
+  ollama-init:
+    image: ollama/ollama:latest
+    depends_on:
+      - ollama
+    environment:
+      - LOCAL_LLM_MODEL=llama3.1
+    entrypoint: ["sh", "-lc", "ollama pull ${LOCAL_LLM_MODEL}"]
+    restart: "no"
+
+volumes:
+  pgdata:
+  ollama:
