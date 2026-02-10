@@ -19,6 +19,12 @@ def _getenv_nonempty(key: str) -> str | None:
     return value
 
 
+def _strip_inline_comment(value: str) -> str:
+    if "#" in value:
+        value = value.split("#", 1)[0]
+    return value.strip()
+
+
 _base_dir = Path(__file__).resolve().parents[2]
 load_dotenv(_base_dir / ".env")
 load_dotenv(_base_dir.parent / ".env")
@@ -65,10 +71,14 @@ class Settings(BaseModel):
     rate_limit_max_keys: int = int(os.getenv("RATE_LIMIT_MAX_KEYS", "10000"))
     rate_limit_key_header: str = os.getenv("RATE_LIMIT_KEY_HEADER", "")
     redis_url: str = os.getenv("REDIS_URL", "")
-    llm_provider: str = os.getenv("LLM_PROVIDER", "heuristic")
-    llm_api_key: str = os.getenv("LLM_API_KEY", os.getenv("OPENAI_API_KEY", ""))
-    llm_base_url: str = os.getenv("LLM_BASE_URL", os.getenv("OPENAI_BASE_URL", "https://api.openai.com"))
-    llm_model: str = os.getenv("LLM_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+    llm_provider: str = _strip_inline_comment(os.getenv("LLM_PROVIDER", "heuristic"))
+    llm_api_key: str = _strip_inline_comment(os.getenv("LLM_API_KEY", ""))
+    llm_base_url: str = _strip_inline_comment(
+        os.getenv("LLM_BASE_URL", os.getenv("OPENAI_BASE_URL", "https://api.openai.com"))
+    )
+    llm_model: str = _strip_inline_comment(
+        os.getenv("LLM_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
+    )
     openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
     openai_base_url: str = os.getenv("OPENAI_BASE_URL", "https://api.openai.com")
     openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")

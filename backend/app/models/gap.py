@@ -31,6 +31,8 @@ class GapAnalysis(Base):
     model: Mapped[str] = mapped_column(String(255), nullable=False)
     prompt_version: Mapped[str] = mapped_column(String(255), nullable=False)
     jd_skills_override: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    processing_started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False

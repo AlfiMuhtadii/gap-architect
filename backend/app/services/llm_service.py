@@ -434,7 +434,7 @@ def _build_prompt(
         "(Repeat for Step 2 and Step 3.)\n\n"
 
         "## Expected Outcomes / Readiness\n"
-        "- Provide 2â€“3 observable readiness bullets.\n\n"
+        "- Provide 2-3 observable readiness bullets.\n\n"
 
         "## Suggested Learning Order\n"
         "1. Same three priority skills in correct order.\n\n"

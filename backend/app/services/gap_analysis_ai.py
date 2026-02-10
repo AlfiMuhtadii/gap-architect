@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
+from datetime import datetime, timezone
 import asyncio
 import logging
 from typing import Any, Protocol
@@ -354,6 +355,7 @@ def _validate_roadmap_markdown(text: str) -> None:
     if positions != sorted(positions):
         raise ValueError("roadmap_markdown headings out of order")
 
+
     def _section_slice(start: str, end: str | None) -> str:
         s = text.split(start, 1)[1]
         if end:
@@ -364,6 +366,15 @@ def _validate_roadmap_markdown(text: str) -> None:
     sentences = [s for s in re.split(r"[.!?]+", gap_summary) if s.strip()]
     if len(sentences) < 1:
         raise ValueError("roadmap_markdown Gap Summary must have at least 1 sentence")
+    placeholder_markers = [
+        "write 23",
+        "provide exactly",
+        "one concise sentence",
+        "one measurable artifact",
+        "clear action title",
+    ]
+    if any(marker in gap_summary.lower() for marker in placeholder_markers):
+        raise ValueError("roadmap_markdown Gap Summary contains placeholders")
 
     priority = _section_slice("## Priority Skills to Learn", "## Concrete Steps")
     priority_items = [
@@ -373,6 +384,8 @@ def _validate_roadmap_markdown(text: str) -> None:
     ]
     if not (1 <= len(priority_items) <= 10):
         raise ValueError("roadmap_markdown Priority Skills must have 1-10 bullets")
+    if any("provide exactly" in line.lower() for line in priority_items):
+        raise ValueError("roadmap_markdown Priority Skills contains placeholders")
 
     steps = _section_slice("## Concrete Steps", "## Expected Outcomes / Readiness")
     step_titles = re.findall(r"^### Step [1-3][\s:]+.+$", steps, flags=re.M)
@@ -380,6 +393,8 @@ def _validate_roadmap_markdown(text: str) -> None:
         raise ValueError("roadmap_markdown Concrete Steps must have 1-3 steps")
     if steps.count("**Why:**") < len(step_titles) or steps.count("**Deliverable:**") < len(step_titles):
         raise ValueError("roadmap_markdown Concrete Steps must include Why and Deliverable")
+    if any(marker in steps.lower() for marker in placeholder_markers):
+        raise ValueError("roadmap_markdown Concrete Steps contains placeholders")
 
     outcomes = _section_slice("## Expected Outcomes / Readiness", "## Suggested Learning Order")
     outcome_items = [
@@ -389,11 +404,15 @@ def _validate_roadmap_markdown(text: str) -> None:
     ]
     if len(outcome_items) < 1:
         raise ValueError("roadmap_markdown Expected Outcomes must have at least 1 bullet")
+    if any("provide" in line.lower() for line in outcome_items):
+        raise ValueError("roadmap_markdown Expected Outcomes contains placeholders")
 
     order = _section_slice("## Suggested Learning Order", None)
     order_items = [line for line in order.splitlines() if re.match(r"^[1-3]\.\s+", line.strip())]
     if len(order_items) < 1 or len(order_items) > 3:
         raise ValueError("roadmap_markdown Suggested Learning Order must have 1-3 items")
+    if any("none" == line.strip().lower() for line in order_items):
+        raise ValueError("roadmap_markdown Suggested Learning Order contains placeholders")
 
 
 def _repair_prompt(base_prompt: str, raw_response: str, error: str) -> str:
@@ -574,6 +593,8 @@ async def run_gap_analysis_ai(
     if analysis is None:
         logger.warning(f"Gap analysis {gap_analysis_id} not found")
         raise ValueError("gap_analysis not found")
+    analysis.processing_started_at = datetime.now(timezone.utc)
+    await session.commit()
 
     def _provider_timeout() -> float:
         return (
@@ -687,6 +708,7 @@ async def run_gap_analysis_ai(
                 return
             analysis.status = GapAnalysisStatus.FAILED_LLM
             analysis.error_message = str(exc)[:1000]
+            analysis.last_error_at = datetime.now(timezone.utc)
             await session.commit()
             return
     except LlmCallError as exc:
@@ -714,6 +736,7 @@ async def run_gap_analysis_ai(
             return
         analysis.status = GapAnalysisStatus.FAILED_LLM
         analysis.error_message = str(exc)
+        analysis.last_error_at = datetime.now(timezone.utc)
         await session.commit()
 
 
@@ -874,6 +897,7 @@ async def _persist_success(
         return
     analysis.status = GapAnalysisStatus.DONE
     analysis.error_message = None
+    analysis.last_error_at = None
     session.add(gap_result)
     try:
         await session.commit()
@@ -888,6 +912,7 @@ async def _persist_success(
             await session.refresh(analysis)
             analysis.status = GapAnalysisStatus.DONE
             analysis.error_message = None
+            analysis.last_error_at = None
             await session.commit()
             return
         raise
@@ -910,6 +935,7 @@ async def _mark_failed_validation(session: AsyncSession, analysis: GapAnalysis, 
             },
         )
     analysis.error_message = truncated_message
+    analysis.last_error_at = datetime.now(timezone.utc)
     await session.commit()
 
 
