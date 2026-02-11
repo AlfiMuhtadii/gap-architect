@@ -1,10 +1,14 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 import pytest
 
 from app.core import config as config_module
 from app.models.gap import GapAnalysis, GapAnalysisStatus
 from app.services.gap_analysis_ai import run_gap_analysis_ai
 from .factories import GapAnalysisPayloadFactory, make_gap_analysis
+from app.services.gap_analysis_service import create_or_get_gap_analysis
+from app.schemas.gap_analysis import GapAnalysisCreate
+from app.services.gap_analysis_service import get_gap_analysis
 
 
 @pytest.mark.asyncio
@@ -43,3 +47,35 @@ async def test_llm_timeout_failed_llm(db_session, monkeypatch):
     await run_gap_analysis_ai(db_session, analysis.id, SlowProvider(), prompt="x")
 
     assert analysis.status == GapAnalysisStatus.FAILED_LLM
+
+
+@pytest.mark.asyncio
+async def test_normalization_same_fingerprint(db_session):
+    payload1 = GapAnalysisCreate(
+        resume_text="Senior Python! Engineer",
+        jd_text="Looking for python engineer.",
+        model="m",
+        prompt_version="v1",
+    )
+    out1 = await create_or_get_gap_analysis(db_session, payload1, background_tasks=None)
+    payload2 = GapAnalysisCreate(
+        resume_text="senior   python engineer",
+        jd_text="looking for PYTHON engineer",
+        model="m",
+        prompt_version="v1",
+    )
+    out2 = await create_or_get_gap_analysis(db_session, payload2, background_tasks=None)
+    assert out1.id == out2.id
+
+
+@pytest.mark.asyncio
+async def test_stuck_pending_moves_to_failed(db_session, monkeypatch):
+    monkeypatch.setattr(config_module.settings, "processing_timeout_seconds", 1)
+    analysis = make_gap_analysis(status=GapAnalysisStatus.PENDING)
+    analysis.processing_started_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+    db_session.add(analysis)
+    await db_session.commit()
+
+    res = await get_gap_analysis(db_session, analysis.id)
+    assert res is not None
+    assert res.status == GapAnalysisStatus.FAILED_LLM

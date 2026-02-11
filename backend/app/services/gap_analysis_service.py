@@ -1,5 +1,6 @@
 import hashlib
 from typing import Optional
+from datetime import datetime, timezone
 from uuid import UUID
 from fastapi import BackgroundTasks
 from sqlalchemy import select
@@ -10,6 +11,20 @@ from app.models.gap import GapAnalysis, GapAnalysisStatus, GapResult
 from app.schemas.gap_analysis import GapAnalysisCreate, GapAnalysisOut, GapResultOut
 from app.services import llm_service
 from app.core.config import settings
+
+
+def _dispatch_processing(gap_analysis_id: UUID, background_tasks: Optional[BackgroundTasks]) -> None:
+    if settings.task_queue == "celery":
+        from app.tasks.gap_analysis import process_gap_analysis_task
+
+        process_gap_analysis_task.delay(str(gap_analysis_id))
+        return
+    if background_tasks is not None:
+        background_tasks.add_task(llm_service.process_gap_analysis, gap_analysis_id)
+        return
+    import asyncio
+
+    asyncio.create_task(llm_service.process_gap_analysis(gap_analysis_id))
 
 
 def _normalize_text(text: str) -> str:
@@ -99,10 +114,7 @@ async def create_or_get_gap_analysis(
         existing.status = GapAnalysisStatus.PENDING
         existing.error_message = None
         await session.commit()
-        if background_tasks is not None:
-            background_tasks.add_task(llm_service.process_gap_analysis, existing.id)
-        else:
-            await llm_service.process_gap_analysis(existing.id)
+        _dispatch_processing(existing.id, background_tasks)
         return GapAnalysisOut(id=existing.id, status=existing.status, result=None)
 
     gap_analysis = GapAnalysis(
@@ -139,10 +151,7 @@ async def create_or_get_gap_analysis(
         raise
     await session.refresh(gap_analysis)
 
-    if background_tasks is not None:
-        background_tasks.add_task(llm_service.process_gap_analysis, gap_analysis.id)
-    else:
-        await llm_service.process_gap_analysis(gap_analysis.id)
+    _dispatch_processing(gap_analysis.id, background_tasks)
 
     return GapAnalysisOut(
         id=gap_analysis.id,
@@ -162,6 +171,16 @@ async def get_gap_analysis(session: AsyncSession, gap_analysis_id: UUID) -> GapA
     analysis = (await session.execute(stmt)).scalars().first()
     if analysis is None:
         return None
+    if (
+        analysis.status == GapAnalysisStatus.PENDING
+        and analysis.processing_started_at is not None
+        and (datetime.now(timezone.utc) - analysis.processing_started_at).total_seconds()
+        > settings.processing_timeout_seconds
+    ):
+        analysis.status = GapAnalysisStatus.FAILED_LLM
+        analysis.error_message = "processing_timeout"
+        analysis.last_error_at = datetime.now(timezone.utc)
+        await session.commit()
     result = analysis.gap_result
     result_out = (
         GapResultOut(

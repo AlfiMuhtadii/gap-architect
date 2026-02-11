@@ -483,7 +483,17 @@ async def process_gap_analysis(gap_analysis_id) -> None:
             max_chars = settings.max_prompt_chars
             if len(resume_text) + len(jd_text) > max_chars:
                 fallback = HeuristicProvider()
-                await run_gap_analysis_ai(session, analysis.id, fallback, _build_prompt(resume_text[:max_chars], jd_text[:max_chars], analysis.jd_skills_override if isinstance(analysis.jd_skills_override, list) else None))
+                await run_gap_analysis_ai(
+                    session,
+                    analysis.id,
+                    fallback,
+                    _build_prompt(
+                        resume_text[:max_chars],
+                        jd_text[:max_chars],
+                        analysis.jd_skills_override if isinstance(analysis.jd_skills_override, list) else None,
+                    ),
+                    fallback_to="heuristic",
+                )
                 return
             if settings.translate_enabled:
                 resume_text = await _translate_text(resume_text, provider)
@@ -495,11 +505,11 @@ async def process_gap_analysis(gap_analysis_id) -> None:
                 jd_text,
                 analysis.jd_skills_override if isinstance(analysis.jd_skills_override, list) else None,
             )
-            await run_gap_analysis_ai(session, analysis.id, provider, prompt)
+            await run_gap_analysis_ai(session, analysis.id, provider, prompt, fallback_to="local_llm")
         except ValueError as exc:
             if "input_too_long" in str(exc):
                 fallback = HeuristicProvider()
-                await run_gap_analysis_ai(session, analysis.id, fallback, prompt)
+                await run_gap_analysis_ai(session, analysis.id, fallback, prompt, fallback_to="heuristic")
                 return
             if "Translation resulted in empty text" in str(exc):
                 analysis.status = GapAnalysisStatus.FAILED_VALIDATION
@@ -511,7 +521,7 @@ async def process_gap_analysis(gap_analysis_id) -> None:
             elif "local_timeout" in str(exc) or "local_llm_failed" in str(exc):
                 logger.warning("local_llm_timeout_fallback", extra={"gap_analysis_id": str(gap_analysis_id)})
                 fallback = HeuristicProvider()
-                await run_gap_analysis_ai(session, analysis.id, fallback, prompt)
+                await run_gap_analysis_ai(session, analysis.id, fallback, prompt, fallback_to="heuristic")
                 return
             else:
                 logger.warning("llm_error_fallback", extra={"gap_analysis_id": str(gap_analysis_id), "error": str(exc)})
@@ -520,11 +530,11 @@ async def process_gap_analysis(gap_analysis_id) -> None:
                     base_url=settings.local_llm_base_url,
                     model=settings.local_llm_model,
                 )
-                await run_gap_analysis_ai(session, analysis.id, local, prompt)
+                await run_gap_analysis_ai(session, analysis.id, local, prompt, fallback_to="heuristic")
                 return
             except Exception:  # noqa: BLE001
                 fallback = HeuristicProvider()
-                await run_gap_analysis_ai(session, analysis.id, fallback, prompt)
+                await run_gap_analysis_ai(session, analysis.id, fallback, prompt, fallback_to="heuristic")
                 return
         except Exception as exc:  # noqa: BLE001
             logger.warning("llm_error_fallback", extra={"gap_analysis_id": str(gap_analysis_id), "error": str(exc)})
@@ -533,10 +543,10 @@ async def process_gap_analysis(gap_analysis_id) -> None:
                     base_url=settings.local_llm_base_url,
                     model=settings.local_llm_model,
                 )
-                await run_gap_analysis_ai(session, analysis.id, local, prompt)
+                await run_gap_analysis_ai(session, analysis.id, local, prompt, fallback_to="heuristic")
                 return
             except Exception:  # noqa: BLE001
                 fallback = HeuristicProvider()
-                await run_gap_analysis_ai(session, analysis.id, fallback, prompt)
+                await run_gap_analysis_ai(session, analysis.id, fallback, prompt, fallback_to="heuristic")
                 return
 logger = logging.getLogger("app.llm_service")

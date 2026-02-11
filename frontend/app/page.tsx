@@ -55,6 +55,7 @@ export default function HomePage() {
   const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
   const [occupationSuggestions, setOccupationSuggestions] = useState<OccupationSuggestion[]>([]);
   const [missingTab, setMissingTab] = useState<"all" | "technical" | "soft" | "language">("all");
+  const [fetchErrors, setFetchErrors] = useState(0);
 
   const fetchStatus = useCallback(async (id: string) => {
     const data = await apiGet<GapAnalysisResponse>(`/api/v1/gap-analyses/${id}`);
@@ -65,17 +66,36 @@ export default function HomePage() {
   }, []);
 
   useEffect(() => {
+    const saved = typeof window !== "undefined" ? localStorage.getItem("gap_analysis_id") : null;
+    if (!analysisId && saved) {
+      setAnalysisId(saved);
+      setStatus("PENDING");
+    }
+  }, [analysisId]);
+
+  useEffect(() => {
     if (!analysisId || status !== "PENDING") return;
-    const timer = setInterval(async () => {
+    let cancelled = false;
+    let attempt = 0;
+    const poll = async () => {
+      if (cancelled) return;
       try {
         const s = await fetchStatus(analysisId);
-        if (s !== "PENDING") clearInterval(timer);
+        setFetchErrors(0);
+        setError(null);
+        if (s !== "PENDING") return;
       } catch (e) {
-        setError("Failed to fetch status");
-        clearInterval(timer);
+        attempt += 1;
+        setFetchErrors((prev) => prev + 1);
+        setError("Failed to fetch status. Retrying...");
       }
-    }, 1500);
-    return () => clearInterval(timer);
+      const backoff = Math.min(1500 + attempt * 500, 8000);
+      setTimeout(poll, backoff);
+    };
+    poll();
+    return () => {
+      cancelled = true;
+    };
   }, [analysisId, status, fetchStatus]);
 
   const onSubmit = async () => {
@@ -93,6 +113,9 @@ export default function HomePage() {
         jd_skills_override: selectedSkills.length ? selectedSkills : null
       });
       setAnalysisId(data.id);
+      if (typeof window !== "undefined") {
+        localStorage.setItem("gap_analysis_id", data.id);
+      }
       setStatus(data.status);
       setResult(data.result ?? null);
       setUserMessage(data.user_message ?? null);
@@ -116,6 +139,9 @@ export default function HomePage() {
     try {
       const data = await apiGet<GapAnalysisResponse>(`/api/v1/gap-analyses/${lookupId.trim()}`);
       setAnalysisId(data.id);
+      if (typeof window !== "undefined") {
+        localStorage.setItem("gap_analysis_id", data.id);
+      }
       setStatus(data.status);
       setResult(data.result ?? null);
       setUserMessage(data.user_message ?? null);
@@ -385,6 +411,11 @@ export default function HomePage() {
           )}
           {status && (
             <span className="text-xs font-semibold text-[var(--text)]">Status: {status}</span>
+          )}
+          {fetchErrors > 0 && (
+            <span className="text-xs text-[var(--text-muted)]">
+              Connectivity issue. Retrying...
+            </span>
           )}
         </div>
 
