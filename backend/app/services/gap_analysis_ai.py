@@ -8,16 +8,14 @@ import logging
 from typing import Any, Protocol
 from uuid import UUID
 
-from pydantic import BaseModel, ValidationError, field_validator, conlist
+from pydantic import BaseModel, ValidationError, field_validator, conlist, Field
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.models.gap import GapAnalysis, GapAnalysisStatus, GapResult, LlmRun, LlmRunStatus
-from app.db.session import AsyncSessionLocal
 from app.core.config import settings
 from app.services.skill_matcher import match_skills
-from app.services.esco_repository import get_skill_depth_map
 
 logger = logging.getLogger("app.gap_analysis_ai")
 
@@ -25,6 +23,7 @@ logger = logging.getLogger("app.gap_analysis_ai")
 class LlmProvider(Protocol):
     name: str
     model: str
+    last_usage: dict[str, Any] | None
 
     async def generate(self, prompt: str) -> str:
         ...
@@ -58,14 +57,9 @@ class InterviewQuestion(BaseModel):
 
 class GapAnalysisAIResult(BaseModel):
     missing_skills: list[str]
-    top_priority_skills: list[str]
-    hard_skills_missing: list[str]
-    soft_skills_missing: list[str]
-    technical_skills_missing: list[str] | None = None
-    transversal_soft_skills_missing: list[str] | None = None
-    language_skills_missing: list[str] | None = None
-    action_steps: conlist(ActionStep, min_length=0, max_length=3)
-    interview_questions: conlist(InterviewQuestion, min_length=0, max_length=3)
+    top_priority_skills: list[str] = Field(default_factory=list)
+    action_steps: conlist(ActionStep, min_length=3, max_length=3)
+    interview_questions: conlist(InterviewQuestion, min_length=3, max_length=3)
     roadmap_markdown: str
     match_percent: float
     match_reason: str
@@ -99,7 +93,7 @@ class GapAnalysisAIResult(BaseModel):
             raise ValueError("match_reason must be non-empty")
         return v
 
-    @field_validator("top_priority_skills", "hard_skills_missing", "soft_skills_missing")
+    @field_validator("top_priority_skills")
     @classmethod
     def _list_non_null(cls, v: list[str]) -> list[str]:
         if v is None:
@@ -109,6 +103,26 @@ class GapAnalysisAIResult(BaseModel):
 
 class LlmCallError(RuntimeError):
     pass
+
+
+def _estimate_cost_usd(model: str, usage: dict[str, Any] | None) -> float | None:
+    if not usage:
+        return None
+    prompt_tokens = int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0)
+    completion_tokens = int(usage.get("completion_tokens") or usage.get("output_tokens") or 0)
+    total_tokens = int(usage.get("total_tokens") or (prompt_tokens + completion_tokens))
+    if total_tokens <= 0:
+        return None
+
+    pricing_per_1m: dict[str, tuple[float, float]] = {
+        "gpt-4o-mini": (0.15, 0.60),
+        "gpt-4.1-mini": (0.40, 1.60),
+    }
+    key = model.lower()
+    if key not in pricing_per_1m:
+        return None
+    in_price, out_price = pricing_per_1m[key]
+    return round((prompt_tokens / 1_000_000 * in_price) + (completion_tokens / 1_000_000 * out_price), 8)
 
 
 def _hash_prompt(prompt: str) -> str:
@@ -221,12 +235,41 @@ def _inject_steps_into_roadmap(roadmap: str, steps: list[dict[str, str]]) -> str
     suffix = match.group(3)
     return re.sub(pattern, f"{prefix}{steps_md}\n{suffix}", roadmap, flags=re.S)
 
+def _ensure_three_topics(missing_skills: list[str]) -> list[str]:
+    base = [str(s).strip() for s in missing_skills if str(s).strip()]
+    fillers = ["system design", "testing strategy", "performance optimization"]
+    out: list[str] = []
+    for item in base + fillers:
+        if item.lower() in {x.lower() for x in out}:
+            continue
+        out.append(item)
+        if len(out) == 3:
+            break
+    return out
+
+
 def _fallback_action_steps(missing_skills: list[str]) -> list[dict[str, str]]:
-    return []
+    topics = _ensure_three_topics(missing_skills)
+    return [
+        {
+            "title": f"Build a production-ready project using {topic}",
+            "why": f"Shows practical capability in {topic} for job-ready delivery.",
+            "deliverable": f"A deployable project module with tests and short architecture notes for {topic}.",
+        }
+        for topic in topics
+    ]
 
 
 def _fallback_interview_questions(missing_skills: list[str]) -> list[dict[str, str]]:
-    return []
+    topics = _ensure_three_topics(missing_skills)
+    return [
+        {
+            "question": f"How would you implement {topic} in a production system?",
+            "focus_gap": topic,
+            "what_good_looks_like": f"Clear design trade-offs, implementation approach, and measurable outcomes for {topic}.",
+        }
+        for topic in topics
+    ]
 
 
 def _coerce_local_payload(parsed: dict[str, Any]) -> None:
@@ -247,15 +290,6 @@ def _coerce_local_payload(parsed: dict[str, Any]) -> None:
         parsed[name] = _to_str_list(parsed.get(name))
 
     _ensure_list("top_priority_skills")
-    _ensure_list("hard_skills_missing")
-    _ensure_list("soft_skills_missing")
-
-    if "technical_skills_missing" not in parsed:
-        parsed["technical_skills_missing"] = None
-    if "transversal_soft_skills_missing" not in parsed:
-        parsed["transversal_soft_skills_missing"] = None
-    if "language_skills_missing" not in parsed:
-        parsed["language_skills_missing"] = None
 
     steps = parsed.get("action_steps")
     if not isinstance(steps, list):
@@ -272,6 +306,8 @@ def _coerce_local_payload(parsed: dict[str, Any]) -> None:
             fixed_steps.append({"title": title, "why": why, "deliverable": deliverable})
         if fixed_steps:
             parsed["action_steps"] = fixed_steps
+    if len(parsed.get("action_steps") or []) != 3:
+        parsed["action_steps"] = _fallback_action_steps(missing)
 
     questions = parsed.get("interview_questions")
     if not isinstance(questions, list):
@@ -290,6 +326,8 @@ def _coerce_local_payload(parsed: dict[str, Any]) -> None:
             )
         if fixed_questions:
             parsed["interview_questions"] = fixed_questions
+    if len(parsed.get("interview_questions") or []) != 3:
+        parsed["interview_questions"] = _fallback_interview_questions(missing)
 
     if not isinstance(parsed.get("match_percent"), (int, float)):
         parsed["match_percent"] = 0.0
@@ -299,12 +337,6 @@ def _coerce_local_payload(parsed: dict[str, Any]) -> None:
         parsed["top_priority_skills"] = [s for s in missing[:3]]
     if parsed.get("top_priority_skills"):
         parsed["top_priority_skills"] = _to_str_list(parsed.get("top_priority_skills"))[:3]
-    if not isinstance(parsed.get("hard_skills_missing"), list):
-        parsed["hard_skills_missing"] = []
-    if not isinstance(parsed.get("soft_skills_missing"), list):
-        parsed["soft_skills_missing"] = []
-    if not parsed["hard_skills_missing"] and missing:
-        parsed["hard_skills_missing"] = missing[:]
 
 
 def _filter_missing_against_jd_and_resume(
@@ -405,8 +437,6 @@ def _repair_prompt(base_prompt: str, raw_response: str, error: str) -> str:
         "{"
         "\"missing_skills\": [\"string\"], "
         "\"top_priority_skills\": [\"string\"], "
-        "\"hard_skills_missing\": [\"string\"], "
-        "\"soft_skills_missing\": [\"string\"], "
         "\"action_steps\": [{\"title\":\"\",\"why\":\"\",\"deliverable\":\"\"}, ... x3], "
         "\"interview_questions\": [{\"question\":\"\",\"focus_gap\":\"\",\"what_good_looks_like\":\"\"}, ... x3], "
         "\"roadmap_markdown\": \"string\", "
@@ -501,7 +531,6 @@ async def _pre_rank_missing_skills(
     if not missing_skills:
         return []
     import re
-    depth_map = await get_skill_depth_map(session)
     scored: list[tuple[float, int, str]] = []
     stopwords = {"and", "or", "the", "a", "an", "of", "to", "in", "on", "for", "with", "by", "at"}
     for idx, skill in enumerate(missing_skills):
@@ -511,9 +540,8 @@ async def _pre_rank_missing_skills(
         if len(tokens) == 1 and (tokens[0] in stopwords or len(tokens[0]) < 3):
             continue
         freq = _count_skill_occurrences(skill, jd_text)
-        depth = depth_map.get(skill.lower(), 0)
         length_bonus = min(len(skill) / 10.0, 2.0)
-        score = (freq * 2.0) + (depth * 1.0) + length_bonus
+        score = (freq * 2.0) + length_bonus
         scored.append((score, idx, skill))
     scored.sort(key=lambda x: (-x[0], x[1]))
     return [s for _, _, s in scored]
@@ -560,6 +588,8 @@ async def run_gap_analysis_ai(
     gap_analysis_id: UUID,
     provider: LlmProvider,
     prompt: str,
+    *,
+    fallback_from: str | None = None,
 ) -> None:
     try:
         analysis = (await session.execute(select(GapAnalysis).where(GapAnalysis.id == gap_analysis_id))).scalars().first()
@@ -582,39 +612,50 @@ async def run_gap_analysis_ai(
             else settings.llm_timeout_seconds
         )
 
-    async def _call_llm(call_prompt: str) -> tuple[dict[str, Any] | None, str | None, int]:
+    async def _call_llm(call_prompt: str) -> tuple[dict[str, Any] | None, str | None, int, int]:
         start = time.perf_counter()
-        try:
-            raw = await asyncio.wait_for(provider.generate(call_prompt), timeout=_provider_timeout())
-        except Exception as exc:  # noqa: BLE001
-            duration_ms = int((time.perf_counter() - start) * 1000)
-            error_text = str(exc) or repr(exc)
-            raise LlmCallError(error_text) from exc
+        attempts = 0
+        while True:
+            attempts += 1
+            try:
+                raw = await asyncio.wait_for(provider.generate(call_prompt), timeout=_provider_timeout())
+                break
+            except Exception as exc:  # noqa: BLE001
+                is_timeout = "timeout" in (str(exc) or "").lower()
+                if attempts < 2 and is_timeout:
+                    continue
+                duration_ms = int((time.perf_counter() - start) * 1000)
+                error_text = str(exc) or repr(exc)
+                raise LlmCallError(error_text) from exc
 
         duration_ms = int((time.perf_counter() - start) * 1000)
         try:
             parsed = _parse_json(raw)
         except Exception as exc:  # noqa: BLE001
             error_text = str(exc) or repr(exc)
-            return None, error_text, duration_ms
+            return None, error_text, duration_ms, attempts
 
-        return parsed, None, duration_ms
+        return parsed, None, duration_ms, attempts
 
     try:
-        parsed, error, duration_ms = await _call_llm(prompt)
+        parsed, error, duration_ms, attempts = await _call_llm(prompt)
         if parsed is None:
             if getattr(provider, "name", "") == "local_llm":
                 raise ValueError("local_invalid_json")
             repaired_prompt = _repair_prompt(prompt, "", error or "invalid JSON")
-            parsed, error, duration_ms = await _call_llm(repaired_prompt)
+            parsed, error, duration_ms, attempts = await _call_llm(repaired_prompt)
             if parsed is None:
+                meta = {
+                    "retry_attempts": attempts,
+                    "fallback_from": fallback_from,
+                }
                 await _log_llm_run(
                     session=session,
                     gap_analysis_id=gap_analysis_id,
                     provider=provider.name,
                     model=provider.model,
                     request_hash=_hash_prompt(repaired_prompt),
-                    response_json={"error": error or "invalid JSON after repair"},
+                    response_json={"error": error or "invalid JSON after repair", "_meta": meta},
                     status=LlmRunStatus.FAILED,
                     error_message=error or "invalid JSON after repair",
                     duration_ms=duration_ms,
@@ -646,15 +687,19 @@ async def run_gap_analysis_ai(
                 except ValidationError as exc_local:
                     raise ValueError("local_invalid_json") from exc_local
             repaired_prompt = _repair_prompt(prompt, json.dumps(parsed, ensure_ascii=True), str(exc))
-            parsed2, error2, duration_ms = await _call_llm(repaired_prompt)
+            parsed2, error2, duration_ms, attempts = await _call_llm(repaired_prompt)
             if parsed2 is None:
+                meta = {
+                    "retry_attempts": attempts,
+                    "fallback_from": fallback_from,
+                }
                 await _log_llm_run(
                     session=session,
                     gap_analysis_id=gap_analysis_id,
                     provider=provider.name,
                     model=provider.model,
                     request_hash=_hash_prompt(repaired_prompt),
-                    response_json={"error": error2 or "invalid JSON after repair"},
+                    response_json={"error": error2 or "invalid JSON after repair", "_meta": meta},
                     status=LlmRunStatus.FAILED,
                     error_message=error2 or "invalid JSON after repair",
                     duration_ms=duration_ms,
@@ -667,13 +712,22 @@ async def run_gap_analysis_ai(
             except ValidationError as exc2:
                 await _mark_failed_validation(session, analysis, str(exc2))
                 return
+        usage = getattr(provider, "last_usage", None) or {}
+        meta = {
+            "retry_attempts": attempts,
+            "fallback_from": fallback_from,
+            "usage": usage if isinstance(usage, dict) else {},
+            "estimated_cost_usd": _estimate_cost_usd(provider.model, usage if isinstance(usage, dict) else None),
+        }
+        parsed_for_log = dict(parsed)
+        parsed_for_log["_meta"] = meta
         await _log_llm_run(
             session=session,
             gap_analysis_id=gap_analysis_id,
             provider=provider.name,
             model=provider.model,
             request_hash=_hash_prompt(prompt),
-            response_json=parsed,
+            response_json=parsed_for_log,
             status=LlmRunStatus.SUCCESS,
             error_message=None,
             duration_ms=duration_ms,
@@ -690,13 +744,17 @@ async def run_gap_analysis_ai(
             await session.commit()
             return
     except LlmCallError as exc:
+        meta = {
+            "retry_attempts": 2 if "timeout" in (str(exc) or "").lower() else 1,
+            "fallback_from": fallback_from,
+        }
         await _log_llm_run(
             session=session,
             gap_analysis_id=gap_analysis_id,
             provider=provider.name,
             model=provider.model,
             request_hash=_hash_prompt(prompt),
-            response_json={"error": str(exc) or "llm_failed"},
+            response_json={"error": str(exc) or "llm_failed", "_meta": meta},
             status=LlmRunStatus.FAILED,
             error_message=str(exc) or "llm_failed",
             duration_ms=0,
@@ -724,20 +782,17 @@ async def _persist_success(
     provider: LlmProvider,
 ) -> None:
     override = analysis.jd_skills_override if isinstance(analysis.jd_skills_override, list) else None
-    missing, match_percent, match_reason, top, technical, transversal_soft, language = await match_skills(
+    missing, match_percent, match_reason, top, *_ = await match_skills(
         resume_text=analysis.resume_text,
         jd_text=analysis.jd_text,
         jd_skills_override=override,
     )
-    use_matcher = settings.use_esco or getattr(provider, "name", "") == "heuristic"
-    if not settings.use_esco and getattr(provider, "name", "") != "heuristic":
+    use_matcher = getattr(provider, "name", "") == "heuristic"
+    if getattr(provider, "name", "") != "heuristic":
         missing = result.missing_skills
         match_percent = result.match_percent
         match_reason = result.match_reason
         top = result.top_priority_skills
-        technical = result.technical_skills_missing or []
-        transversal_soft = result.transversal_soft_skills_missing or []
-        language = result.language_skills_missing or []
 
     if use_matcher:
         ranked = await _rank_missing_skills(session, missing, analysis.jd_text)
@@ -799,6 +854,11 @@ async def _persist_success(
     action_steps = _steps_to_dicts(action_steps)
     interview_questions = _questions_to_dicts(interview_questions)
 
+    if len(action_steps) != 3:
+        action_steps = _fallback_action_steps(missing)
+    if len(interview_questions) != 3:
+        interview_questions = _fallback_interview_questions(missing)
+
     def _step_to_dict(step: Any) -> dict[str, str]:
         if isinstance(step, dict):
             return {
@@ -827,33 +887,6 @@ async def _persist_success(
         if len(action_steps) >= 1:
             roadmap_markdown = _inject_steps_into_roadmap(roadmap_markdown, action_steps)
 
-    if use_matcher:
-        llm_classified = await _llm_classify_skills(provider, missing)
-        if llm_classified:
-            llm_hard, llm_soft = llm_classified
-            def _merge_case_insensitive(base: list[str], extra: list[str]) -> list[str]:
-                seen = {b.lower(): b for b in base}
-                for s in extra:
-                    key = s.lower()
-                    if key not in seen:
-                        seen[key] = s
-                return list(seen.values())
-
-            if llm_hard:
-                filtered = [
-                    s
-                    for s in llm_hard
-                    if s.lower() not in {x.lower() for x in transversal_soft + language}
-                ]
-                technical = _merge_case_insensitive(technical, filtered)
-            if llm_soft:
-                filtered = [
-                    s
-                    for s in llm_soft
-                    if s.lower() not in {x.lower() for x in technical + language}
-                ]
-                transversal_soft = _merge_case_insensitive(transversal_soft, filtered)
-
     gap_result = GapResult(
         gap_analysis_id=analysis.id,
         missing_skills=missing,
@@ -863,11 +896,6 @@ async def _persist_success(
         match_percent=match_percent,
         match_reason=match_reason,
         top_priority_skills=top,
-        hard_skills_missing=technical,
-        soft_skills_missing=(transversal_soft + language),
-        technical_skills_missing=technical if technical else None,
-        transversal_soft_skills_missing=transversal_soft if transversal_soft else None,
-        language_skills_missing=language if language else None,
     )
     await session.refresh(analysis)
     if analysis.status == GapAnalysisStatus.DONE and analysis.gap_result is not None:
@@ -935,6 +963,5 @@ async def _log_llm_run(
         error_message=error_message,
         duration_ms=duration_ms,
     )
-    async with AsyncSessionLocal() as log_session:
-        log_session.add(run)
-        await log_session.commit()
+    session.add(run)
+    await session.flush()

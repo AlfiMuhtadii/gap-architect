@@ -75,22 +75,12 @@ class Settings(BaseModel):
     local_llm_base_url: str = os.getenv("LOCAL_LLM_BASE_URL", "http://localhost:11434")
     local_llm_model: str = os.getenv("LOCAL_LLM_MODEL", "llama3.1")
     _base_dir: Path = _base_dir
-    esco_skills_csv: str = os.getenv(
-        "ESCO_SKILLS_CSV",
-        str(_base_dir / "datasets" / "skill_en.csv"),
-    )
     canonical_skills_path: str = os.getenv(
         "CANONICAL_SKILLS_PATH",
         str(_base_dir / "datasets" / "canonical_skills.txt"),
     )
-    use_esco: bool = os.getenv("USE_ESCO", "false").lower() == "true"
-    embedding_provider: str = os.getenv("EMBEDDING_PROVIDER", "none")
-    openai_embedding_model: str = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-    embedding_similarity_threshold: float = float(os.getenv("EMBEDDING_SIM_THRESHOLD", "0.55"))
-    embedding_candidate_limit: int = int(os.getenv("EMBEDDING_CANDIDATE_LIMIT", "250"))
     translate_enabled: bool = os.getenv("TRANSLATE_ENABLED", "false").lower() == "true"
     translate_target_lang: str = os.getenv("TRANSLATE_TARGET_LANG", "en")
-    esco_cache_ttl_seconds: int = int(os.getenv("ESCO_CACHE_TTL_SECONDS", "300"))
     max_prompt_chars: int = int(os.getenv("MAX_PROMPT_CHARS", "60000"))
 
 

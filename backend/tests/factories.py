@@ -39,11 +39,6 @@ def make_gap_result(gap_analysis_id) -> GapResult:
         gap_analysis_id=gap_analysis_id,
         missing_skills=["a", "b"],
         top_priority_skills=["a"],
-        hard_skills_missing=["a"],
-        soft_skills_missing=["b"],
-        technical_skills_missing=["a"],
-        transversal_soft_skills_missing=["b"],
-        language_skills_missing=[],
         action_steps=[{"title": "t", "why": "w", "deliverable": "d"}] * 3,
         interview_questions=[
             {"question": "q", "focus_gap": "g", "what_good_looks_like": "w"}

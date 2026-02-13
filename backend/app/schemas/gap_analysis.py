@@ -60,17 +60,12 @@ class GapAnalysisCreate(BaseModel):
 class GapResultOut(BaseModel):
     missing_skills: Any
     top_priority_skills: list[str] | None = None
-    hard_skills_missing: list[str] | None = None
-    soft_skills_missing: list[str] | None = None
-    technical_skills_missing: list[str] | None = None
-    transversal_soft_skills_missing: list[str] | None = None
-    language_skills_missing: list[str] | None = None
-    grouping_enabled: bool | None = None
     action_steps: Any
     interview_questions: Any
     roadmap_markdown: str
     match_percent: float | None = None
     match_reason: str | None = None
+    generation_meta: dict[str, Any] | None = None
 
     class Config:
         from_attributes = True
@@ -93,13 +88,3 @@ class SkillDetectRequest(BaseModel):
 class SkillDetectResponse(BaseModel):
     jd_skills: list[str]
     resume_skills: list[str]
-
-
-class OccupationSuggestion(BaseModel):
-    concept_uri: str
-    preferred_label: str
-    score: float
-
-
-class OccupationSuggestResponse(BaseModel):
-    suggestions: list[OccupationSuggestion]

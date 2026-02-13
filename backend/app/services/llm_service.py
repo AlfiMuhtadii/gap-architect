@@ -136,6 +136,7 @@ class OpenAICompatibleProvider:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self.last_usage: dict | None = None
 
     async def generate(self, prompt: str) -> str:
         if not self.api_key:
@@ -172,6 +173,7 @@ class OpenAICompatibleProvider:
             except httpx.RequestError as exc:
                 raise ValueError(f"llm_network_error: {exc}") from exc
             data = resp.json()
+        self.last_usage = data.get("usage") if isinstance(data, dict) else None
         choices = data.get("choices") if isinstance(data, dict) else None
         if not choices:
             raise ValueError("LLM response missing choices")
@@ -189,6 +191,7 @@ class LocalLLMProvider:
         self.api_key = "local"
         self.base_url = base_url.rstrip("/")
         self.model = model
+        self.last_usage: dict | None = None
 
     async def generate(self, prompt: str) -> str:
         url = f"{self.base_url}/api/chat"
@@ -226,12 +229,18 @@ class LocalLLMProvider:
         content = message.get("content") if isinstance(message, dict) else None
         if not content:
             raise ValueError("Local LLM response missing content")
+        self.last_usage = {
+            "input_chars": len(prompt),
+            "output_chars": len(content),
+            "total_tokens": max((len(prompt) + len(content)) // 4, 0),
+        }
         return content
 
 
 class HeuristicProvider:
     name = "heuristic"
     model = "heuristic-v1"
+    last_usage: dict | None = None
 
     async def generate(self, prompt: str) -> str:
         resume_text, jd_text = _extract_payload(prompt)
@@ -241,9 +250,7 @@ class HeuristicProvider:
             match_percent,
             match_reason,
             top_priority,
-            technical_missing,
-            transversal_missing,
-            language_missing,
+            *_
         ) = await match_skills(resume_text, jd_text, override)
 
         if not missing:
@@ -271,11 +278,6 @@ class HeuristicProvider:
             {
                 "missing_skills": missing,
                 "top_priority_skills": top_priority,
-                "hard_skills_missing": technical_missing,
-                "soft_skills_missing": transversal_missing + language_missing,
-                "technical_skills_missing": technical_missing,
-                "transversal_soft_skills_missing": transversal_missing,
-                "language_skills_missing": language_missing,
                 "action_steps": steps,
                 "interview_questions": questions,
                 "roadmap_markdown": roadmap.strip(),
@@ -505,7 +507,7 @@ async def process_gap_analysis(gap_analysis_id) -> None:
             elif "local_timeout" in str(exc) or "local_llm_failed" in str(exc):
                 logger.warning("local_llm_timeout_fallback", extra={"gap_analysis_id": str(gap_analysis_id)})
                 fallback = HeuristicProvider()
-                await run_gap_analysis_ai(session, analysis.id, fallback, prompt)
+                await run_gap_analysis_ai(session, analysis.id, fallback, prompt, fallback_from="local_llm")
                 return
             else:
                 logger.warning("llm_error_fallback", extra={"gap_analysis_id": str(gap_analysis_id), "error": str(exc)})
@@ -514,11 +516,11 @@ async def process_gap_analysis(gap_analysis_id) -> None:
                     base_url=settings.local_llm_base_url,
                     model=settings.local_llm_model,
                 )
-                await run_gap_analysis_ai(session, analysis.id, local, prompt)
+                await run_gap_analysis_ai(session, analysis.id, local, prompt, fallback_from="primary")
                 return
             except Exception:  # noqa: BLE001
                 fallback = HeuristicProvider()
-                await run_gap_analysis_ai(session, analysis.id, fallback, prompt)
+                await run_gap_analysis_ai(session, analysis.id, fallback, prompt, fallback_from="primary_or_local")
                 return
         except Exception as exc:  # noqa: BLE001
             logger.warning("llm_error_fallback", extra={"gap_analysis_id": str(gap_analysis_id), "error": str(exc)})
@@ -527,10 +529,10 @@ async def process_gap_analysis(gap_analysis_id) -> None:
                     base_url=settings.local_llm_base_url,
                     model=settings.local_llm_model,
                 )
-                await run_gap_analysis_ai(session, analysis.id, local, prompt)
+                await run_gap_analysis_ai(session, analysis.id, local, prompt, fallback_from="primary")
                 return
             except Exception:  # noqa: BLE001
                 fallback = HeuristicProvider()
-                await run_gap_analysis_ai(session, analysis.id, fallback, prompt)
+                await run_gap_analysis_ai(session, analysis.id, fallback, prompt, fallback_from="primary_or_local")
                 return
 logger = logging.getLogger("app.llm_service")

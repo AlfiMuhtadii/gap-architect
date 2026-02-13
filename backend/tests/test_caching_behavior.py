@@ -18,7 +18,7 @@ async def test_caching_behavior(client, db_session, monkeypatch):
 
     payload = GapAnalysisPayloadFactory().build()
     res1 = await client.post("/api/v1/gap-analyses", json=payload)
-    assert res1.status_code == 200
+    assert res1.status_code == 201
     body1 = res1.json()
     assert body1["status"] == "PENDING"
 
@@ -41,5 +41,3 @@ async def test_caching_behavior(client, db_session, monkeypatch):
     assert body2["result"]["match_percent"] == 80.0
     assert body2["result"]["match_reason"] == "Matched 8 of 10 skills"
     assert body2["result"]["top_priority_skills"] == ["a"]
-    assert body2["result"]["hard_skills_missing"] == ["a"]
-    assert body2["result"]["soft_skills_missing"] == ["b"]

@@ -7,12 +7,6 @@ import { apiGet, apiPost } from "@/lib/api";
 type GapResult = {
   missing_skills: string[];
   top_priority_skills: string[];
-  hard_skills_missing: string[];
-  soft_skills_missing: string[];
-  technical_skills_missing?: string[];
-  transversal_soft_skills_missing?: string[];
-  language_skills_missing?: string[];
-  grouping_enabled?: boolean;
   action_steps: { title: string; why: string; deliverable: string }[];
   interview_questions: {
     question: string;
@@ -28,11 +22,6 @@ type GapAnalysisResponse = {
   id: string;
   status: "PENDING" | "DONE" | "FAILED_VALIDATION" | "FAILED_LLM";
   result?: GapResult | null;
-};
-type OccupationSuggestion = {
-  concept_uri: string;
-  preferred_label: string;
-  score: number;
 };
 
 const DEFAULT_MODEL = "gpt-4o-mini";
@@ -50,8 +39,6 @@ export default function HomePage() {
   const [jdSkills, setJdSkills] = useState<string[]>([]);
   const [resumeSkills, setResumeSkills] = useState<string[]>([]);
   const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
-  const [occupationSuggestions, setOccupationSuggestions] = useState<OccupationSuggestion[]>([]);
-  const [missingTab, setMissingTab] = useState<"all" | "technical" | "soft" | "language">("all");
 
   const fetchStatus = useCallback(async (id: string) => {
     const data = await apiGet<GapAnalysisResponse>(`/api/v1/gap-analyses/${id}`);
@@ -91,12 +78,6 @@ export default function HomePage() {
       setStatus(data.status);
       setResult(data.result ?? null);
       setIsSubmitting(false);
-      apiPost<{ suggestions: OccupationSuggestion[] }>(
-        "/api/v1/gap-analyses/suggest-occupations",
-        { resume_text: resumeText, jd_text: jdText }
-      )
-        .then((occ) => setOccupationSuggestions(occ.suggestions))
-        .catch(() => setError("Occupation suggestion failed"));
     } catch (e) {
       setError("Submission failed");
       setIsSubmitting(false);
@@ -126,65 +107,46 @@ export default function HomePage() {
       setJdSkills(data.jd_skills);
       setResumeSkills(data.resume_skills);
       setSelectedSkills(data.jd_skills);
-      const occ = await apiPost<{ suggestions: OccupationSuggestion[] }>(
-        "/api/v1/gap-analyses/suggest-occupations",
-        { resume_text: resumeText, jd_text: jdText }
-      );
-      setOccupationSuggestions(occ.suggestions);
     } catch (e) {
       setError("Skill detection failed");
     }
   };
 
-  const technicalMissing = result?.technical_skills_missing ?? result?.hard_skills_missing ?? [];
-  const softMissing =
-    result?.transversal_soft_skills_missing ?? result?.soft_skills_missing ?? [];
-  const languageMissing = result?.language_skills_missing ?? [];
-  const hasCategorizedMissing =
-    (technicalMissing?.length ?? 0) + (softMissing?.length ?? 0) + (languageMissing?.length ?? 0) >
-    0;
-  const questionsMarkdown =
-    result?.interview_questions
-      ?.map(
-        (q, i) =>
-          `${i + 1}. **${q.question}**\n   - Focus gap: ${q.focus_gap}\n   - What good looks like: ${q.what_good_looks_like}`
-      )
-      .join("\n") ?? "";
   const markdownComponents = {
-    h1: ({ children }: { children: React.ReactNode }) => (
+    h1: ({ children }: { children?: React.ReactNode }) => (
       <h1 className="text-xl font-semibold text-[var(--text)]">{children}</h1>
     ),
-    h2: ({ children }: { children: React.ReactNode }) => (
+    h2: ({ children }: { children?: React.ReactNode }) => (
       <h2 className="mt-4 border-b border-[var(--border)] pb-2 text-base font-semibold text-[var(--text)]">
         {children}
       </h2>
     ),
-    h3: ({ children }: { children: React.ReactNode }) => (
+    h3: ({ children }: { children?: React.ReactNode }) => (
       <h3 className="mt-3 text-sm font-semibold text-[var(--text)]">{children}</h3>
     ),
-    p: ({ children }: { children: React.ReactNode }) => (
+    p: ({ children }: { children?: React.ReactNode }) => (
       <p className="mt-2 text-sm text-[var(--text-muted)]">{children}</p>
     ),
-    ul: ({ children }: { children: React.ReactNode }) => (
+    ul: ({ children }: { children?: React.ReactNode }) => (
       <ul className="mt-3 grid gap-2">{children}</ul>
     ),
-    ol: ({ children }: { children: React.ReactNode }) => (
+    ol: ({ children }: { children?: React.ReactNode }) => (
       <ol className="mt-3 list-decimal space-y-2 pl-5">{children}</ol>
     ),
-    li: ({ children }: { children: React.ReactNode }) => (
+    li: ({ children }: { children?: React.ReactNode }) => (
       <li className="rounded-xl border border-[var(--border)] bg-white px-3 py-2 text-sm text-[var(--text)] shadow-sm">
         {children}
       </li>
     ),
-    blockquote: ({ children }: { children: React.ReactNode }) => (
+    blockquote: ({ children }: { children?: React.ReactNode }) => (
       <blockquote className="mt-3 rounded-xl border border-[var(--border)] bg-slate-50 px-4 py-3 text-sm text-[var(--text-muted)]">
         {children}
       </blockquote>
     ),
-    strong: ({ children }: { children: React.ReactNode }) => (
+    strong: ({ children }: { children?: React.ReactNode }) => (
       <strong className="text-[var(--text)]">{children}</strong>
     ),
-    code: ({ children }: { children: React.ReactNode }) => (
+    code: ({ children }: { children?: React.ReactNode }) => (
       <code className="rounded bg-slate-100 px-1.5 py-0.5 text-xs text-slate-800">
         {children}
       </code>
@@ -195,21 +157,20 @@ export default function HomePage() {
     if (typeof node === "string") return node;
     if (Array.isArray(node)) return node.map(getText).join("");
     if (node && typeof node === "object" && "props" in node) {
-      // @ts-expect-error - ReactNode props shape
       return getText(node.props.children);
     }
     return "";
   };
   const roadmapComponents = {
-    h1: ({ children }: { children: React.ReactNode }) => (
+    h1: ({ children }: { children?: React.ReactNode }) => (
       <h1 className="text-2xl font-semibold text-[var(--text)]">{children}</h1>
     ),
-    h2: ({ children }: { children: React.ReactNode }) => (
+    h2: ({ children }: { children?: React.ReactNode }) => (
       <h2 className="mt-10 border-b border-slate-200 pb-2 text-lg font-semibold text-slate-900">
         {children}
       </h2>
     ),
-    h3: ({ children }: { children: React.ReactNode }) => {
+    h3: ({ children }: { children?: React.ReactNode }) => {
       const text = getText(children);
       const isStep = text.toLowerCase().startsWith("step");
       if (!isStep) {
@@ -223,7 +184,7 @@ export default function HomePage() {
         </div>
       );
     },
-    p: ({ children }: { children: React.ReactNode }) => {
+    p: ({ children }: { children?: React.ReactNode }) => {
       const text = getText(children);
       const normalize = (value: string) => value.replace(/\s+/g, " ").trim();
       const whyMatch = text.match(/(?:^|[\n\r])\s*Why\s*:\s*([^]*?)(?=(?:Deliverable\s*:|$))/i);
@@ -250,22 +211,22 @@ export default function HomePage() {
       }
       return <p className="mt-3 text-sm leading-relaxed text-slate-600">{children}</p>;
     },
-    ul: ({ children }: { children: React.ReactNode }) => (
+    ul: ({ children }: { children?: React.ReactNode }) => (
       <ul className="mt-3 list-disc space-y-2 pl-6">{children}</ul>
     ),
-    ol: ({ children }: { children: React.ReactNode }) => (
+    ol: ({ children }: { children?: React.ReactNode }) => (
       <ol className="mt-3 list-decimal space-y-2 pl-6">{children}</ol>
     ),
-    li: ({ children }: { children: React.ReactNode }) => (
+    li: ({ children }: { children?: React.ReactNode }) => (
       <li className="text-sm text-slate-700">{children}</li>
     ),
-    strong: ({ children }: { children: React.ReactNode }) => (
+    strong: ({ children }: { children?: React.ReactNode }) => (
       <strong className="text-slate-900">{children}</strong>
     ),
-    em: ({ children }: { children: React.ReactNode }) => (
+    em: ({ children }: { children?: React.ReactNode }) => (
       <em className="text-slate-500">{children}</em>
     ),
-    code: ({ children }: { children: React.ReactNode }) => (
+    code: ({ children }: { children?: React.ReactNode }) => (
       <code className="rounded bg-slate-100 px-1.5 py-0.5 text-xs text-slate-800">
         {children}
       </code>
@@ -413,131 +374,20 @@ export default function HomePage() {
             </div>
 
             <div className="rounded-2xl border border-[var(--border)] bg-white/80 p-5 shadow-sm backdrop-blur">
-              {hasCategorizedMissing && (
-                <div className="flex flex-wrap gap-2">
-                  <button
-                    className={`rounded-full px-3 py-1 text-xs font-semibold ${
-                      missingTab === "all"
-                        ? "bg-[var(--brand)] text-white"
-                        : "bg-slate-100 text-slate-700"
-                    }`}
-                    onClick={() => setMissingTab("all")}
-                  >
-                    All
-                  </button>
-                  <button
-                    className={`rounded-full px-3 py-1 text-xs font-semibold ${
-                      missingTab === "technical"
-                        ? "bg-[var(--brand)] text-white"
-                        : "bg-slate-100 text-slate-700"
-                    }`}
-                    onClick={() => setMissingTab("technical")}
-                  >
-                    Technical
-                  </button>
-                  <button
-                    className={`rounded-full px-3 py-1 text-xs font-semibold ${
-                      missingTab === "soft"
-                        ? "bg-[var(--brand)] text-white"
-                        : "bg-slate-100 text-slate-700"
-                    }`}
-                    onClick={() => setMissingTab("soft")}
-                  >
-                    Transversal
-                  </button>
-                  <button
-                    className={`rounded-full px-3 py-1 text-xs font-semibold ${
-                      missingTab === "language"
-                        ? "bg-[var(--brand)] text-white"
-                        : "bg-slate-100 text-slate-700"
-                    }`}
-                    onClick={() => setMissingTab("language")}
-                  >
-                    Language
-                  </button>
-                </div>
-              )}
-              <div className="mt-4 space-y-3">
+              <div className="mt-1 space-y-3">
                 <h2 className="text-lg font-semibold text-[var(--text)]">Missing Skills</h2>
-                {!hasCategorizedMissing && (
-                  <div className="flex flex-wrap gap-2">
-                    {(result?.missing_skills ?? []).map((skill, i) => (
-                      <span
-                        key={`${skill}-${i}`}
-                        className="fade-in-up rounded-full border border-red-100 bg-red-50 px-3 py-1 text-xs font-semibold text-[var(--danger)]"
-                      >
-                        {skill}
-                      </span>
-                    ))}
-                  </div>
-                )}
-                {hasCategorizedMissing && missingTab === "all" && (
-                  <div className="flex flex-wrap gap-2">
-                    {result.missing_skills.map((skill, i) => (
-                      <span
-                        key={`${skill}-${i}`}
-                        className="fade-in-up rounded-full border border-red-100 bg-red-50 px-3 py-1 text-xs font-semibold text-[var(--danger)]"
-                      >
-                        {skill}
-                      </span>
-                    ))}
-                  </div>
-                )}
-                {hasCategorizedMissing && missingTab === "technical" && (
-                  <div className="flex flex-wrap gap-2">
-                    {technicalMissing.map((skill, i) => (
-                      <span
-                        key={`${skill}-${i}`}
-                        className="fade-in-up rounded-full border border-red-100 bg-red-50 px-3 py-1 text-xs font-semibold text-[var(--danger)]"
-                      >
-                        {skill}
-                      </span>
-                    ))}
-                  </div>
-                )}
-                {hasCategorizedMissing && missingTab === "soft" && (
-                  <div className="flex flex-wrap gap-2">
-                    {softMissing.map((skill, i) => (
-                      <span
-                        key={`${skill}-${i}`}
-                        className="fade-in-up rounded-full border border-red-100 bg-red-50 px-3 py-1 text-xs font-semibold text-[var(--danger)]"
-                      >
-                        {skill}
-                      </span>
-                    ))}
-                  </div>
-                )}
-                {hasCategorizedMissing && missingTab === "language" && (
-                  <div className="flex flex-wrap gap-2">
-                    {languageMissing.map((skill, i) => (
-                      <span
-                        key={`${skill}-${i}`}
-                        className="fade-in-up rounded-full border border-red-100 bg-red-50 px-3 py-1 text-xs font-semibold text-[var(--danger)]"
-                      >
-                        {skill}
-                      </span>
-                    ))}
-                  </div>
-                )}
-              </div>
-            </div>
-
-            {result?.grouping_enabled && occupationSuggestions.length > 0 && (
-              <div className="rounded-2xl border border-[var(--border)] bg-white/80 p-5 shadow-sm backdrop-blur">
-                <h2 className="text-lg font-semibold text-[var(--text)]">Suggested Occupations</h2>
-                <div className="mt-3 flex flex-wrap gap-2">
-                  {occupationSuggestions.map((o, i) => (
+                <div className="flex flex-wrap gap-2">
+                  {(result?.missing_skills ?? []).map((skill, i) => (
                     <span
-                      key={o.concept_uri}
-                      className="fade-in-up rounded-full border border-indigo-100 bg-indigo-50 px-3 py-1 text-xs font-semibold text-indigo-700"
-                      style={{ animationDelay: `${Math.min(i * 20, 400)}ms` }}
+                      key={`${skill}-${i}`}
+                      className="fade-in-up rounded-full border border-red-100 bg-red-50 px-3 py-1 text-xs font-semibold text-[var(--danger)]"
                     >
-                      {o.preferred_label}
+                      {skill}
                     </span>
                   ))}
                 </div>
               </div>
-            )}
+            </div>
 
             <div className="rounded-2xl border border-[var(--border)] bg-white/80 p-5 shadow-sm backdrop-blur">
               <div className="text-xs font-semibold uppercase tracking-widest text-[var(--text-muted)]">
@@ -577,7 +427,7 @@ export default function HomePage() {
                 <div className="text-xs font-semibold uppercase tracking-widest text-[var(--text-muted)]">
                   Roadmap (Markdown)
                 </div>
-                <div className="text-xs font-semibold text-[var(--brand-ink)]">AI-Generated</div>
+                
               </div>
               <div className="mt-6">
                 <div className="prose prose-slate max-w-none text-slate-800 prose-p:leading-relaxed prose-li:leading-relaxed prose-headings:tracking-tight prose-h2:mt-10 prose-h2:mb-2 prose-h3:mt-6 prose-h3:mb-1">

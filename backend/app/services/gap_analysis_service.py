@@ -6,10 +6,9 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-from app.models.gap import GapAnalysis, GapAnalysisStatus, GapResult
+from app.models.gap import GapAnalysis, GapAnalysisStatus, GapResult, LlmRun
 from app.schemas.gap_analysis import GapAnalysisCreate, GapAnalysisOut, GapResultOut
 from app.services import llm_service
-from app.core.config import settings
 
 
 def _normalize_text(text: str) -> str:
@@ -40,13 +39,26 @@ def _build_result_out(result: GapResult | None) -> GapResultOut | None:
         match_percent=result.match_percent,
         match_reason=result.match_reason,
         top_priority_skills=result.top_priority_skills,
-        hard_skills_missing=result.hard_skills_missing,
-        soft_skills_missing=result.soft_skills_missing,
-        technical_skills_missing=result.technical_skills_missing,
-        transversal_soft_skills_missing=result.transversal_soft_skills_missing,
-        language_skills_missing=result.language_skills_missing,
-        grouping_enabled=settings.use_esco,
     )
+
+
+def _build_generation_meta(analysis: GapAnalysis) -> dict | None:
+    runs = list(getattr(analysis, "llm_runs", []) or [])
+    if not runs:
+        return None
+    latest: LlmRun = max(runs, key=lambda r: r.created_at or 0)
+    response_json = latest.response_json if isinstance(latest.response_json, dict) else {}
+    meta = response_json.get("_meta") if isinstance(response_json, dict) else None
+    out = {
+        "provider": latest.provider,
+        "model": latest.model,
+        "status": str(latest.status.value if hasattr(latest.status, "value") else latest.status),
+        "duration_ms": latest.duration_ms,
+        "created_at": latest.created_at.isoformat() if latest.created_at else None,
+    }
+    if isinstance(meta, dict):
+        out.update(meta)
+    return out
 
 
 async def create_or_get_gap_analysis(
@@ -63,15 +75,18 @@ async def create_or_get_gap_analysis(
     stmt = (
         select(GapAnalysis)
         .where(GapAnalysis.fingerprint == fingerprint)
-        .options(selectinload(GapAnalysis.gap_result))
+        .options(selectinload(GapAnalysis.gap_result), selectinload(GapAnalysis.llm_runs))
     )
     existing = (await session.execute(stmt)).scalars().first()
 
     if existing and existing.status == GapAnalysisStatus.DONE:
+        result_out = _build_result_out(existing.gap_result)
+        if result_out is not None:
+            result_out.generation_meta = _build_generation_meta(existing)
         return GapAnalysisOut(
             id=existing.id,
             status=existing.status,
-            result=_build_result_out(existing.gap_result),
+            result=result_out,
         )
 
     if existing and existing.status == GapAnalysisStatus.PENDING:
@@ -103,10 +118,13 @@ async def create_or_get_gap_analysis(
         await session.rollback()
         existing = (await session.execute(stmt)).scalars().first()
         if existing and existing.status == GapAnalysisStatus.DONE:
+            result_out = _build_result_out(existing.gap_result)
+            if result_out is not None:
+                result_out.generation_meta = _build_generation_meta(existing)
             return GapAnalysisOut(
                 id=existing.id,
                 status=existing.status,
-                result=_build_result_out(existing.gap_result),
+                result=result_out,
             )
         if existing:
             return GapAnalysisOut(id=existing.id, status=existing.status, result=None)
@@ -125,7 +143,7 @@ async def get_gap_analysis(session: AsyncSession, gap_analysis_id: UUID) -> GapA
     stmt = (
         select(GapAnalysis)
         .where(GapAnalysis.id == gap_analysis_id)
-        .options(selectinload(GapAnalysis.gap_result))
+        .options(selectinload(GapAnalysis.gap_result), selectinload(GapAnalysis.llm_runs))
     )
     analysis = (await session.execute(stmt)).scalars().first()
     if analysis is None:
@@ -140,12 +158,7 @@ async def get_gap_analysis(session: AsyncSession, gap_analysis_id: UUID) -> GapA
             match_percent=result.match_percent,
             match_reason=result.match_reason,
             top_priority_skills=result.top_priority_skills,
-            hard_skills_missing=result.hard_skills_missing,
-            soft_skills_missing=result.soft_skills_missing,
-            technical_skills_missing=result.technical_skills_missing,
-            transversal_soft_skills_missing=result.transversal_soft_skills_missing,
-            language_skills_missing=result.language_skills_missing,
-            grouping_enabled=settings.use_esco,
+            generation_meta=_build_generation_meta(analysis),
         )
         if isinstance(result, GapResult)
         else None

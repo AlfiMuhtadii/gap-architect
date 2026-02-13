@@ -1,4 +1,4 @@
-# Canonical skills (deterministic fallback when USE_ESCO=false)
+# Canonical skills
 python
 golang
 go

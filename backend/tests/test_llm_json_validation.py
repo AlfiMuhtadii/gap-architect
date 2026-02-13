@@ -10,21 +10,20 @@ from .factories import make_gap_analysis
 class ValidProvider:
     name = "valid"
     model = "valid-1"
+    last_usage = None
 
     async def generate(self, prompt: str) -> str:
         return (
             '{'
             '"missing_skills":["a","b"],'
             '"top_priority_skills":["a"],'
-            '"hard_skills_missing":["a"],'
-            '"soft_skills_missing":["b"],'
             '"action_steps":[{"title":"t1","why":"w1","deliverable":"d1"},'
             '{"title":"t2","why":"w2","deliverable":"d2"},'
             '{"title":"t3","why":"w3","deliverable":"d3"}],'
             '"interview_questions":[{"question":"q1","focus_gap":"g1","what_good_looks_like":"w1"},'
             '{"question":"q2","focus_gap":"g2","what_good_looks_like":"w2"},'
             '{"question":"q3","focus_gap":"g3","what_good_looks_like":"w3"}],'
-            '"roadmap_markdown":"rm",'
+            '"roadmap_markdown":"## Gap Summary\\nGood baseline.\\n\\n## Priority Skills to Learn\\n- a\\n- b\\n- c\\n\\n## Concrete Steps\\n### Step 1: t1\\n**Why:** w1\\n**Deliverable:** d1\\n### Step 2: t2\\n**Why:** w2\\n**Deliverable:** d2\\n### Step 3: t3\\n**Why:** w3\\n**Deliverable:** d3\\n\\n## Expected Outcomes / Readiness\\n- o1\\n- o2\\n\\n## Suggested Learning Order\\n1. a\\n2. b\\n3. c",'
             '"match_percent":75.5,'
             '"match_reason":"Matched 3 of 4 skills"'
             '}'
@@ -34,6 +33,7 @@ class ValidProvider:
 class InvalidProvider:
     name = "invalid"
     model = "invalid-1"
+    last_usage = None
 
     def __init__(self):
         self.calls = 0

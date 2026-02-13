@@ -36,27 +36,19 @@ async def test_retry_failed_status_resets_and_reprocesses(client, db_session, mo
     await db_session.commit()
 
     res = await client.post("/api/v1/gap-analyses", json=payload)
-    assert res.status_code == 200
+    assert res.status_code == 201
     body = res.json()
     assert body["status"] == "PENDING"
     assert called["count"] == 1
 
 
-class EmptyEmbeddingProvider:
-    name = "empty"
-    model = "empty-1"
-
-    async def embed_texts(self, texts):
-        return []
-
-
 @pytest.mark.asyncio
-async def test_embedding_empty_falls_back(monkeypatch):
+async def test_match_skills_token_fallback_without_taxonomy(monkeypatch):
     from app.services import skill_matcher as skill_matcher_module
 
-    monkeypatch.setattr(skill_matcher_module, "get_embedding_provider", lambda: EmptyEmbeddingProvider())
     async def _empty_map():
         return {}
+
     monkeypatch.setattr(skill_matcher_module, "get_skill_taxonomy_map_db", _empty_map)
     monkeypatch.setattr(skill_matcher_module, "extract_skills", lambda _text: [])
     missing, match_percent, reason, *_ = await match_skills(
@@ -67,16 +59,6 @@ async def test_embedding_empty_falls_back(monkeypatch):
     assert "Fallback token match" in reason
     assert isinstance(missing, list)
     assert match_percent >= 0
-
-
-@pytest.mark.asyncio
-async def test_suggest_occupations_empty_embeddings_fallback(monkeypatch, db_session):
-    from app.services import skill_matcher as skill_matcher_module
-
-    monkeypatch.setattr(skill_matcher_module, "get_embedding_provider", lambda: EmptyEmbeddingProvider())
-    rows = [("1", "software engineer"), ("2", "data engineer")]
-    res = await skill_matcher_module.suggest_occupations_semantic("software engineer", rows)
-    assert isinstance(res, list)
 
 
 def test_prompt_truncation(monkeypatch):

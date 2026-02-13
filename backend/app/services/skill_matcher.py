@@ -5,15 +5,12 @@ import re
 from typing import Iterable
 
 from app.core.config import settings
-from app.services.embedding_provider import get_embedding_provider
 from app.services.skill_taxonomy import extract_missing_skills, extract_skills, get_skill_taxonomy, get_skill_taxonomy_map_db
-from app.services.esco_repository import get_soft_skill_labels, get_language_skill_labels
 from app.db.session import AsyncSessionLocal
 
 
 _WORD_RE = re.compile(r"[a-z0-9\+\#\-\.]+")
 _SKILL_STOPWORDS = {"on", "of", "and", "the", "for", "to", "in", "with", "as", "at"}
-_MAX_EMBEDDING_CANDIDATES = 500
 
 
 def _tokens(text: str) -> list[str]:
@@ -49,15 +46,11 @@ async def match_skills(
         if removed:
             reason = f"{reason} Resume text filter applied."
         top = _top_priority_from_matches(matched, jd_text)
-        technical, transversal_soft, language = (
-            await _split_skill_categories(missing) if settings.use_esco else (missing, [], [])
-        )
+        technical, transversal_soft, language = (missing, [], [])
         missing, match_percent, reason = await _apply_language_requirements(
             missing, total, jd_text, resume_text, reason
         )
-        technical, transversal_soft, language = (
-            await _split_skill_categories(missing) if settings.use_esco else (missing, [], [])
-        )
+        technical, transversal_soft, language = (missing, [], [])
         return missing, match_percent, reason, top, technical, transversal_soft, language
     taxonomy_map = await get_skill_taxonomy_map_db()
     if taxonomy_map:
@@ -83,9 +76,7 @@ async def match_skills(
             missing, match_percent, reason = await _apply_language_requirements(
                 missing, total, jd_text, resume_text, reason
             )
-            technical, transversal_soft, language = (
-                await _split_skill_categories(missing) if settings.use_esco else (missing, [], [])
-            )
+            technical, transversal_soft, language = (missing, [], [])
             return missing, match_percent, reason, top, technical, transversal_soft, language
 
         # Fallback: token overlap between JD skills and resume text
@@ -103,58 +94,10 @@ async def match_skills(
         missing, match_percent, reason = await _apply_language_requirements(
             missing, total, jd_text, resume_text, reason
         )
-        technical, transversal_soft, language = (
-            await _split_skill_categories(missing) if settings.use_esco else (missing, [], [])
-        )
+        technical, transversal_soft, language = (missing, [], [])
         return missing, match_percent, reason, top, technical, transversal_soft, language
 
-    provider = get_embedding_provider()
-    if provider is None:
-        return await _fallback_token_match(resume_text, jd_text)
-
-    candidates = _candidate_skills(jd_text)
-    if not candidates:
-        return await _fallback_token_match(resume_text, jd_text)
-
-    texts = [jd_text, resume_text] + candidates
-    try:
-        embeddings = await provider.embed_texts(texts)
-    except Exception:  # noqa: BLE001
-        return await _fallback_token_match(resume_text, jd_text)
-    if not embeddings or len(embeddings) != len(texts):
-        return await _fallback_token_match(resume_text, jd_text)
-    jd_vec = embeddings[0]
-    resume_vec = embeddings[1]
-    skill_vecs = embeddings[2:]
-
-    threshold = settings.embedding_similarity_threshold
-    matched = 0
-    missing: list[str] = []
-    matched_skills: list[str] = []
-    for skill, vec in zip(candidates, skill_vecs):
-        sim_jd = _cosine(jd_vec, vec)
-        sim_resume = _cosine(resume_vec, vec)
-        if sim_jd >= threshold and sim_resume >= threshold:
-            matched += 1
-            matched_skills.append(skill)
-        elif sim_jd >= threshold and sim_resume < threshold:
-            missing.append(skill)
-
-    missing, removed_jd = _filter_missing_by_jd_text(missing, jd_text)
-    missing, removed = _filter_missing_by_resume_text(missing, resume_text)
-    total = max(matched + len(missing), 1)
-    match_percent = round((matched / total) * 100, 2)
-    reason = f"Embedding match on {total} candidate skills; {len(missing)} missing identified."
-    if removed or removed_jd:
-        reason = f"{reason} Resume text filter applied."
-    top = _top_priority_from_matches(matched_skills, jd_text)
-    missing, match_percent, reason = await _apply_language_requirements(
-        missing, total, jd_text, resume_text, reason
-    )
-    technical, transversal_soft, language = (
-        await _split_skill_categories(missing) if settings.use_esco else (missing, [], [])
-    )
-    return missing, match_percent, reason, top, technical, transversal_soft, language
+    return await _fallback_token_match(resume_text, jd_text)
 
 
 async def _fallback_token_match(
@@ -183,15 +126,11 @@ async def _fallback_token_match(
     if removed or removed_jd:
         reason = f"{reason} Resume text filter applied."
     top = _top_priority_from_matches(matched, jd_text)
-    technical, transversal_soft, language = (
-        await _split_skill_categories(missing) if settings.use_esco else (missing, [], [])
-    )
+    technical, transversal_soft, language = (missing, [], [])
     missing, match_percent, reason = await _apply_language_requirements(
         missing, total, jd_text, resume_text, reason
     )
-    technical, transversal_soft, language = (
-        await _split_skill_categories(missing) if settings.use_esco else (missing, [], [])
-    )
+    technical, transversal_soft, language = (missing, [], [])
     return missing, match_percent, reason, top, technical, transversal_soft, language
 
 
@@ -257,12 +196,6 @@ async def detect_skills(resume_text: str, jd_text: str) -> tuple[list[str], list
     if not resume_skills:
         resume_skills = list(dict.fromkeys(_tokens(resume_text)))
 
-    if settings.use_esco:
-        jd_lang = await _detect_language_skills(jd_text)
-        resume_lang = await _detect_language_skills(resume_text)
-        jd_skills = list(dict.fromkeys(jd_skills + jd_lang))
-        resume_skills = list(dict.fromkeys(resume_skills + resume_lang))
-
     return jd_skills, resume_skills
 
 
@@ -291,57 +224,8 @@ async def suggest_occupations_semantic(
     candidate_limit: int = 200,
     top_k: int = 3,
 ) -> list[tuple[str, str, float]]:
-    provider = get_embedding_provider()
-    if provider is None:
-        return suggest_occupations(resume_text, occupations)
-    candidate_limit = max(0, min(candidate_limit, _MAX_EMBEDDING_CANDIDATES))
-
-    resume_tokens = set(_tokens(resume_text))
-    candidates: list[tuple[str, str]] = []
-    if resume_tokens:
-        for concept_uri, label in occupations:
-            if not label:
-                continue
-            label_tokens = set(_tokens(label))
-            if label_tokens & resume_tokens:
-                candidates.append((concept_uri, label))
-            if len(candidates) >= candidate_limit:
-                break
-    else:
-        candidates = occupations[:candidate_limit]
-
-    if not candidates:
-        return []
-
-    texts = [resume_text] + [label for _, label in candidates]
-    embeddings = await provider.embed_texts(texts)
-    if not embeddings or len(embeddings) != len(texts):
-        return suggest_occupations(resume_text, occupations)
-    resume_vec = embeddings[0]
-    scores: list[tuple[str, str, float]] = []
-    for (concept_uri, label), vec in zip(candidates, embeddings[1:]):
-        score = _cosine(resume_vec, vec)
-        scores.append((concept_uri, label, round(score, 4)))
-    scores.sort(key=lambda x: x[2], reverse=True)
-    return scores[:top_k]
-
-
-def _candidate_skills(jd_text: str) -> list[str]:
-    taxonomy = get_skill_taxonomy()
-    if not taxonomy:
-        return []
-    jd_tokens = set(_tokens(jd_text))
-    if not jd_tokens:
-        return []
-    limit = min(settings.embedding_candidate_limit, _MAX_EMBEDDING_CANDIDATES)
-    candidates: list[str] = []
-    for skill in taxonomy:
-        skill_tokens = set(_tokens(skill))
-        if skill_tokens & jd_tokens:
-            candidates.append(skill)
-        if len(candidates) >= limit:
-            break
-    return candidates
+    _ = candidate_limit, top_k
+    return suggest_occupations(resume_text, occupations)
 
 
 def _extract_skills_from_map(text: str, mapping: dict[str, str]) -> list[str]:
@@ -379,58 +263,12 @@ def _top_priority_from_matches(matched_skills: list[str], jd_text: str, limit: i
 async def _split_skill_categories(
     skills: list[str],
 ) -> tuple[list[str], list[str], list[str]]:
-    if not skills:
-        return [], [], []
-    async with AsyncSessionLocal() as session:
-        soft_labels = await get_soft_skill_labels(session)
-        lang_labels = await get_language_skill_labels(session)
-        soft_labels = soft_labels | lang_labels
-    transversal_soft: list[str] = []
-    technical: list[str] = []
-    language: list[str] = []
-    for s in skills:
-        sl = " ".join(_WORD_RE.findall(s.lower()))
-        if sl in lang_labels or any(l in sl or sl in l for l in lang_labels):
-            language.append(s)
-        elif sl in soft_labels:
-            transversal_soft.append(s)
-        else:
-            technical.append(s)
-    return technical, transversal_soft, language
+    return skills, [], []
 
 
 async def _detect_language_skills(text: str) -> list[str]:
-    t = " ".join(_WORD_RE.findall(text.lower()))
-    if not t:
-        return []
-    t_tokens = t.split()
-    t_token_set = set(t_tokens)
-    if len(t_tokens) > 1200:
-        # skip fuzzy matching for very long texts to avoid heavy Levenshtein cost
-        t_tokens = t_tokens[:1200]
-        t_token_set = set(t_tokens)
-    async with AsyncSessionLocal() as session:
-        lang_labels = await get_language_skill_labels(session)
-    if not lang_labels:
-        return []
-    found: list[str] = []
-    for label in lang_labels:
-        if not label:
-            continue
-        if len(label) < 4:
-            continue
-        l_tokens = label.split()
-        if len(l_tokens) > 1:
-            if all(lt in t_token_set for lt in l_tokens):
-                found.append(label)
-            continue
-        target = l_tokens[0]
-        if target in t_token_set:
-            found.append(label)
-            continue
-        if len(t_tokens) <= 1200 and len(target) >= 6 and _fuzzy_contains(t, label):
-            found.append(label)
-    return list(dict.fromkeys(found))
+    _ = text
+    return []
 
 
 async def _apply_language_requirements(
@@ -440,15 +278,7 @@ async def _apply_language_requirements(
     resume_text: str,
     reason: str,
 ) -> tuple[list[str], float, str]:
-    jd_lang = await _detect_language_skills(jd_text)
-    resume_lang = await _detect_language_skills(resume_text)
-    if not jd_lang:
-        return missing, round((1 - (len(missing) / max(total, 1))) * 100, 2), reason
-    missing_lang = [l for l in jd_lang if l not in resume_lang]
-    if missing_lang:
-        missing = missing + [l for l in missing_lang if l not in missing]
-        total = total + len(jd_lang)
-        reason = f"{reason} Language requirements applied."
+    _ = jd_text, resume_text
     match_percent = round((1 - (len(missing) / max(total, 1))) * 100, 2)
     return missing, match_percent, reason
 

@@ -17,7 +17,6 @@ from app.db.base import Base
 import app.models  # noqa: F401
 from app.api.deps import get_async_session
 from app.main import app
-from app.core import config as config_module
 
 
 @compiles(JSONB, "sqlite")
@@ -64,8 +63,3 @@ async def client(db_session: AsyncSession):
         yield ac
     app.dependency_overrides.clear()
 
-
-@pytest.fixture(autouse=True)
-def _test_settings(monkeypatch):
-    monkeypatch.setattr(config_module.settings, "use_esco", False)
-    monkeypatch.setattr(config_module.settings, "embedding_provider", "none")

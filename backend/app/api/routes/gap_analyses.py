@@ -1,4 +1,4 @@
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response
 from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_async_session
@@ -7,12 +7,9 @@ from app.schemas.gap_analysis import (
     GapAnalysisOut,
     SkillDetectRequest,
     SkillDetectResponse,
-    OccupationSuggestResponse,
-    OccupationSuggestion,
 )
-from app.services.skill_matcher import detect_skills, suggest_occupations_semantic
-from sqlalchemy import select
-from app.models.esco import EscoOccupation
+from app.models.gap import GapAnalysisStatus
+from app.services.skill_matcher import detect_skills
 from app.services.gap_analysis_service import create_or_get_gap_analysis, get_gap_analysis
 
 
@@ -23,10 +20,13 @@ router = APIRouter()
 async def create_gap_analysis(
     payload: GapAnalysisCreate,
     background_tasks: BackgroundTasks,
+    response: Response,
     session: AsyncSession = Depends(get_async_session),
 ) -> GapAnalysisOut:
     try:
-        return await create_or_get_gap_analysis(session=session, payload=payload, background_tasks=background_tasks)
+        result = await create_or_get_gap_analysis(session=session, payload=payload, background_tasks=background_tasks)
+        response.status_code = 200 if result.status == GapAnalysisStatus.DONE else 201
+        return result
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -35,17 +35,6 @@ async def create_gap_analysis(
 async def detect_gap_skills(payload: SkillDetectRequest) -> SkillDetectResponse:
     jd_skills, resume_skills = await detect_skills(payload.resume_text, payload.jd_text)
     return SkillDetectResponse(jd_skills=jd_skills, resume_skills=resume_skills)
-
-
-@router.post("/gap-analyses/suggest-occupations", response_model=OccupationSuggestResponse)
-async def suggest_gap_occupations(
-    payload: SkillDetectRequest, session: AsyncSession = Depends(get_async_session)
-) -> OccupationSuggestResponse:
-    rows = await session.execute(select(EscoOccupation.concept_uri, EscoOccupation.preferred_label))
-    suggestions = await suggest_occupations_semantic(payload.resume_text, rows.fetchall())
-    return OccupationSuggestResponse(
-        suggestions=[OccupationSuggestion(concept_uri=uri, preferred_label=label, score=score) for uri, label, score in suggestions]
-    )
 
 
 @router.get("/gap-analyses/{gap_analysis_id}", response_model=GapAnalysisOut)
