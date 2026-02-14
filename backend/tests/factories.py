@@ -6,8 +6,18 @@ from app.models.gap import GapAnalysis, GapAnalysisStatus, GapResult
 
 @dataclass
 class GapAnalysisPayloadFactory:
-    resume_text: str = "Senior Engineer with Python"
-    jd_text: str = "Looking for a Python engineer"
+    resume_text: str = (
+        "Senior engineer with eight years building backend services using Python, FastAPI, "
+        "PostgreSQL, Docker, Kubernetes, AWS, CI/CD, monitoring, and testing. "
+        "Led migration projects, designed APIs, improved reliability, mentored teammates, "
+        "collaborated with product and design, and delivered production systems with measurable impact."
+    )
+    jd_text: str = (
+        "We are looking for a backend engineer to build API services with Python, SQL, AWS, "
+        "Docker, Kubernetes, observability, security, testing, and scalable architecture. "
+        "Candidates should collaborate cross-functionally, write clean code, review pull requests, "
+        "own incident response, and deliver reliable production features."
+    )
     model: str = "gpt-test"
     prompt_version: str = "v1"
 

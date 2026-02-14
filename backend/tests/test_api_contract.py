@@ -35,4 +35,3 @@ async def test_post_and_get_gap_analysis(client, db_session, monkeypatch):
     assert body_get["result"]["roadmap_markdown"] == "rm"
     assert body_get["result"]["match_percent"] == 80.0
     assert body_get["result"]["match_reason"] == "Matched 8 of 10 skills"
-    assert body_get["result"]["top_priority_skills"] == ["a"]

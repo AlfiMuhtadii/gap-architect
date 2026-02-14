@@ -22,7 +22,7 @@ async def test_caching_behavior(client, db_session, monkeypatch):
     body1 = res1.json()
     assert body1["status"] == "PENDING"
 
-    fp = _fingerprint(_normalize_text(payload["resume_text"]), _normalize_text(payload["jd_text"]), None)
+    fp = _fingerprint(_normalize_text(payload["resume_text"]), _normalize_text(payload["jd_text"]))
     analysis = (await db_session.execute(select(GapAnalysis).where(GapAnalysis.fingerprint == fp))).scalars().first()
     analysis.status = GapAnalysisStatus.DONE
     db_session.add(make_gap_result(analysis.id))
@@ -40,4 +40,3 @@ async def test_caching_behavior(client, db_session, monkeypatch):
     assert body2["result"]["roadmap_markdown"] == "rm"
     assert body2["result"]["match_percent"] == 80.0
     assert body2["result"]["match_reason"] == "Matched 8 of 10 skills"
-    assert body2["result"]["top_priority_skills"] == ["a"]

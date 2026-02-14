@@ -1,16 +1,62 @@
 from __future__ import annotations
 
+import json
 import re
 import logging
+import asyncio
 from typing import Iterable
 import httpx
 from sqlalchemy import select
 
 from app.core.config import settings
 from app.db.session import AsyncSessionLocal
-from app.models.gap import GapAnalysis, GapAnalysisStatus
+from app.models.gap import GapAnalysis
 from app.services.gap_analysis_ai import run_gap_analysis_ai, LlmProvider
-from app.services.skill_matcher import match_skills, detect_skills
+from app.services.log_sanitize import sanitize_for_log
+from app.services.skill_matcher import match_skills
+
+_INFLIGHT_IDS: set[str] = set()
+_INFLIGHT_GUARD = asyncio.Lock()
+_JOB_SEMAPHORE = asyncio.Semaphore(max(int(settings.max_concurrent_gap_jobs), 1))
+
+
+def _flatten_exception_messages(exc: BaseException) -> list[str]:
+    messages: list[str] = []
+    seen: set[int] = set()
+
+    def _walk(err: BaseException | None) -> None:
+        if err is None:
+            return
+        ident = id(err)
+        if ident in seen:
+            return
+        seen.add(ident)
+
+        if hasattr(err, "exceptions") and isinstance(getattr(err, "exceptions"), tuple):
+            for child in getattr(err, "exceptions"):
+                if isinstance(child, BaseException):
+                    _walk(child)
+
+        text = str(err).strip()
+        if text and text not in messages:
+            messages.append(text)
+
+        cause = getattr(err, "__cause__", None)
+        if isinstance(cause, BaseException):
+            _walk(cause)
+        context = getattr(err, "__context__", None)
+        if isinstance(context, BaseException):
+            _walk(context)
+
+    _walk(exc)
+    return messages
+
+
+def _format_exception(prefix: str, exc: BaseException) -> str:
+    parts = _flatten_exception_messages(exc)
+    if parts:
+        return f"{prefix}: {' | '.join(parts[:3])}"
+    return f"{prefix}: {exc.__class__.__name__}"
 
 
 def _infer_context(jd_text: str) -> str:
@@ -36,24 +82,20 @@ def _infer_context(jd_text: str) -> str:
 def _rank_missing_skills(missing: list[str], jd_text: str) -> list[str]:
     if not missing:
         return []
-    scored: list[tuple[float, int, str]] = []
-    stopwords = {"and", "or", "the", "a", "an", "of", "to", "in", "on", "for", "with", "by", "at"}
+    scored: list[tuple[int, int, int, str]] = []
     jd = jd_text.lower()
     for idx, skill in enumerate(missing):
         s = str(skill).strip()
         if not s:
             continue
-        tokens = re.findall(r"[a-z0-9\+\#\-\.]+", s.lower())
-        if not tokens:
-            continue
-        if len(tokens) == 1 and (tokens[0] in stopwords or len(tokens[0]) < 3):
-            continue
-        freq = len(re.findall(r"\b" + re.escape(tokens[0]) + r"\b", jd)) if tokens else 0
-        length_bonus = min(len(s) / 10.0, 2.0)
-        score = (freq * 2.0) + length_bonus
-        scored.append((score, idx, s))
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    return [s for _, _, s in scored][:3]
+        s_lower = s.lower()
+        freq = jd.count(s_lower)
+        first_pos = jd.find(s_lower)
+        if first_pos < 0:
+            first_pos = 10**9
+        scored.append((freq, first_pos, idx, s))
+    scored.sort(key=lambda x: (-x[0], x[1], x[2]))
+    return [s for _, _, _, s in scored][:3]
 
 
 def _build_action_steps(missing: list[str], jd_text: str) -> list[dict[str, str]]:
@@ -138,14 +180,15 @@ class OpenAICompatibleProvider:
         self.model = model
         self.last_usage: dict | None = None
 
-    async def generate(self, prompt: str) -> str:
+    async def generate(self, prompt: str, *, temperature: float | None = None) -> str:
         if not self.api_key:
-            raise ValueError("OPENAI_API_KEY is required for openai provider")
+            raise ValueError("LLM_API_KEY is required for llm provider")
         url = f"{self.base_url}/v1/chat/completions"
         headers = {"Authorization": f"Bearer {self.api_key}"}
         payload = {
             "model": self.model,
-            "temperature": 0.2,
+            "temperature": 0.3 if temperature is None else float(temperature),
+            "response_format": {"type": "json_object"},
             "messages": [
                 {
                     "role": "system",
@@ -171,7 +214,7 @@ class OpenAICompatibleProvider:
                     raise ValueError("rate_limited") from exc
                 raise ValueError(f"llm_http_{status}: {body}") from exc
             except httpx.RequestError as exc:
-                raise ValueError(f"llm_network_error: {exc}") from exc
+                raise ValueError(_format_exception("llm_network_error", exc)) from exc
             data = resp.json()
         self.last_usage = data.get("usage") if isinstance(data, dict) else None
         choices = data.get("choices") if isinstance(data, dict) else None
@@ -193,7 +236,7 @@ class LocalLLMProvider:
         self.model = model
         self.last_usage: dict | None = None
 
-    async def generate(self, prompt: str) -> str:
+    async def generate(self, prompt: str, *, temperature: float | None = None) -> str:
         url = f"{self.base_url}/api/chat"
         headers = {"Content-Type": "application/json"}
         payload = {
@@ -205,6 +248,7 @@ class LocalLLMProvider:
                 },
                 {"role": "user", "content": prompt},
             ],
+            "temperature": 0.3 if temperature is None else float(temperature),
             "stream": False,
             "format": "json",
         }
@@ -223,7 +267,7 @@ class LocalLLMProvider:
                         body = ""
                 raise ValueError(f"local_llm_http_{status}: {body}") from exc
             except httpx.RequestError as exc:
-                raise ValueError(f"local_llm_network_error: {exc}") from exc
+                raise ValueError(_format_exception("local_llm_network_error", exc)) from exc
             data = resp.json()
         message = data.get("message") if isinstance(data, dict) else None
         content = message.get("content") if isinstance(message, dict) else None
@@ -242,16 +286,14 @@ class HeuristicProvider:
     model = "heuristic-v1"
     last_usage: dict | None = None
 
-    async def generate(self, prompt: str) -> str:
+    async def generate(self, prompt: str, *, temperature: float | None = None) -> str:
         resume_text, jd_text = _extract_payload(prompt)
-        override = _extract_override(prompt)
         (
             missing,
             match_percent,
             match_reason,
             top_priority,
-            *_
-        ) = await match_skills(resume_text, jd_text, override)
+        ) = match_skills(resume_text, jd_text)
 
         if not missing:
             resume_tokens = _extract_tokens(resume_text)
@@ -287,37 +329,12 @@ class HeuristicProvider:
         )
 
 
-async def _translate_text(text: str, provider: LlmProvider) -> str:
-    if not text.strip():
-        return text
-    prompt = (
-        "Translate the following text to English. Preserve technical terms and proper nouns. "
-        "Return ONLY the translated text.\n\n"
-        f"{text}"
-    )
-    try:
-        return await provider.generate(prompt)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("translation_failed", extra={"error": str(exc)})
-        return text
-
-
 def _extract_payload(prompt: str) -> tuple[str, str]:
     resume_match = re.search(r"RESUME_TEXT:\s*(.*?)\s*JD_TEXT:", prompt, re.S | re.I)
     jd_match = re.search(r"JD_TEXT:\s*(.*)$", prompt, re.S | re.I)
     resume = resume_match.group(1).strip() if resume_match else ""
     jd = jd_match.group(1).strip() if jd_match else ""
     return resume, jd
-
-
-def _extract_override(prompt: str) -> list[str] | None:
-    match = re.search(r"HR_CONFIRMED_JD_SKILLS:(.*)$", prompt, re.S | re.I)
-    if not match:
-        return None
-    raw = match.group(1).strip()
-    if not raw:
-        return None
-    return [line.strip() for line in raw.splitlines() if line.strip()]
 
 
 def _extract_tokens(text: str) -> list[str]:
@@ -390,20 +407,22 @@ def _to_json(payload: dict) -> str:
 def _build_prompt(
     resume_text: str,
     jd_text: str,
-    jd_skills_override: list[str] | None = None,
+    *,
+    deterministic_missing_skills: list[str] | None = None,
+    deterministic_top_priority_skills: list[str] | None = None,
+    deterministic_match_percent: float | None = None,
+    deterministic_match_reason: str | None = None,
 ) -> str:
     """
     Deterministic, token-efficient, validator-friendly prompt.
     Designed to minimize retries and malformed JSON.
     """
-
-    override_text = ""
-    if jd_skills_override:
-        override_text = "\n\nHR_CONFIRMED_JD_SKILLS:\n" + "\n".join(jd_skills_override)
-
     prompt = (
-        "You are performing a precise Resumeâ€“Job Description gap analysis.\n\n"
+        "You are performing a precise Resume Job Description gap analysis.\n\n"
 
+        "Some JDs include company history, others start directly with requirements.\n"
+        "Identify technical requirements regardless of position.\n"
+        "If the text is short, assume every word may be relevant.\n\n"
         "Return ONLY valid JSON with this exact schema:\n"
         "{"
         "\"missing_skills\": [\"string\"], "
@@ -416,27 +435,32 @@ def _build_prompt(
 
         "Core rules:\n"
         "- missing_skills = skills in JD but not in Resume.\n"
-        "- match_percent = percentage overlap of JD skills found in Resume (0â€“100).\n"
+        "- Extract only missing technical skills explicitly mentioned in the provided JD.\n"
+        "- If the resume already covers a skill, DO NOT include it in missing_skills.\n"
+        "- match_percent = percentage overlap of JD skills found in Resume (0-100).\n"
         "- match_reason = 1 concise sentence explaining the calculation basis.\n"
         "- action_steps and interview_questions MUST contain exactly 3 items.\n"
+        "- In each action_steps[i].why, explain bridge logic from likely existing candidate skill to target missing skill.\n"
+        "- Suggested Learning Order MUST follow technical dependencies from foundational to advanced.\n"
+        "- Do NOT order by popularity; order by prerequisite chain.\n"
         "- Do NOT include explanations outside JSON.\n\n"
         "- Concrete Steps in roadmap_markdown MUST mirror action_steps (same titles, whys, deliverables).\n\n"
 
         "roadmap_markdown MUST be valid GitHub-Flavored Markdown with EXACT structure:\n"
         "## Gap Summary\n"
-        "- Write 2â€“3 concise sentences describing readiness gap.\n\n"
+        "- Write 2-3 concise sentences describing readiness gap.\n\n"
 
         "## Priority Skills to Learn\n"
         "- Provide exactly 3 bullet skill names.\n\n"
 
         "## Concrete Steps\n"
-        "### Step 1 â€” Clear Action Title\n"
+        "### Step 1 Clear Action Title\n"
         "**Why:** One concise sentence.\n"
         "**Deliverable:** One measurable artifact.\n"
         "(Repeat for Step 2 and Step 3.)\n\n"
 
         "## Expected Outcomes / Readiness\n"
-        "- Provide 2â€“3 observable readiness bullets.\n\n"
+        "- Provide 2-3 observable readiness bullets.\n\n"
 
         "## Suggested Learning Order\n"
         "1. Same three priority skills in correct order.\n\n"
@@ -446,9 +470,25 @@ def _build_prompt(
         "- No extra sections.\n"
         "- Deterministic heading order required.\n"
         "- Output MUST be valid JSON only.\n\n"
+        "- Use DETERMINISTIC_GAP_INPUT as source of truth for missing_skills, match_percent, and match_reason.\n"
+        "- Do not add or remove missing skills outside DETERMINISTIC_GAP_INPUT.\n\n"
 
         f"RESUME_TEXT:\n{resume_text}\n\n"
-        f"JD_TEXT:\n{jd_text}{override_text}"
+        f"JD_TEXT:\n{jd_text}\n\n"
+        "DETERMINISTIC_GAP_INPUT:\n"
+        + json.dumps(
+            {
+                "missing_skills": deterministic_missing_skills or [],
+                "top_priority_skills": deterministic_top_priority_skills or [],
+                "match_percent": (
+                    float(deterministic_match_percent)
+                    if deterministic_match_percent is not None
+                    else 0.0
+                ),
+                "match_reason": deterministic_match_reason or "",
+            },
+            ensure_ascii=True,
+        )
     )
 
     # Token-safety truncation
@@ -474,65 +514,100 @@ def get_provider() -> LlmProvider:
 
 
 async def process_gap_analysis(gap_analysis_id) -> None:
-    async with AsyncSessionLocal() as session:
-        analysis = (
-            await session.execute(select(GapAnalysis).where(GapAnalysis.id == gap_analysis_id))
-        ).scalars().first()
-        if analysis is None:
-            logger.warning("gap_analysis missing during background processing", extra={"gap_analysis_id": str(gap_analysis_id)})
+    key = str(gap_analysis_id)
+    async with _INFLIGHT_GUARD:
+        if key in _INFLIGHT_IDS:
+            logger.info("gap_analysis_already_inflight", extra={"gap_analysis_id": key})
             return
-        provider = get_provider()
-        resume_text = analysis.resume_text
-        jd_text = analysis.jd_text
-        try:
-            if settings.translate_enabled:
-                resume_text = await _translate_text(resume_text, provider)
-                jd_text = await _translate_text(jd_text, provider)
-                if not resume_text.strip() or not jd_text.strip():
-                    raise ValueError("Translation resulted in empty text")
+        _INFLIGHT_IDS.add(key)
+    try:
+        async with _JOB_SEMAPHORE:
+            # Short DB session: fetch input only, then close before LLM network call.
+            async with AsyncSessionLocal() as read_session:
+                analysis = (
+                    await read_session.execute(select(GapAnalysis).where(GapAnalysis.id == gap_analysis_id))
+                ).scalars().first()
+                if analysis is None:
+                    logger.warning(
+                        "gap_analysis missing during background processing",
+                        extra={"gap_analysis_id": str(gap_analysis_id)},
+                    )
+                    return
+                resume_text = analysis.resume_text
+                jd_text = analysis.jd_text
+
+            missing_skills, match_percent, match_reason, top_priority = match_skills(
+                resume_text=resume_text,
+                jd_text=jd_text,
+            )
             prompt = _build_prompt(
                 resume_text,
                 jd_text,
-                analysis.jd_skills_override if isinstance(analysis.jd_skills_override, list) else None,
+                deterministic_missing_skills=missing_skills,
+                deterministic_top_priority_skills=top_priority,
+                deterministic_match_percent=match_percent,
+                deterministic_match_reason=match_reason,
             )
-            await run_gap_analysis_ai(session, analysis.id, provider, prompt)
+
+        async def _run_with_new_session(
+            provider: LlmProvider,
+            *,
+            fallback_from: str | None = None,
+        ) -> None:
+            async with AsyncSessionLocal() as write_session:
+                await run_gap_analysis_ai(
+                    write_session,
+                    gap_analysis_id,
+                    provider,
+                    prompt,
+                    fallback_from=fallback_from,
+                    raise_on_provider_failure=True,
+                )
+
+        provider = get_provider()
+        try:
+            await _run_with_new_session(provider)
         except ValueError as exc:
-            if "Translation resulted in empty text" in str(exc):
-                analysis.status = GapAnalysisStatus.FAILED_VALIDATION
-                analysis.error_message = str(exc)[:1000]
-                await session.commit()
-                return
             if "rate_limited" in str(exc):
                 logger.warning("llm_rate_limited_fallback", extra={"gap_analysis_id": str(gap_analysis_id)})
             elif "local_timeout" in str(exc) or "local_llm_failed" in str(exc):
                 logger.warning("local_llm_timeout_fallback", extra={"gap_analysis_id": str(gap_analysis_id)})
                 fallback = HeuristicProvider()
-                await run_gap_analysis_ai(session, analysis.id, fallback, prompt, fallback_from="local_llm")
+                await _run_with_new_session(fallback, fallback_from="local_llm")
                 return
             else:
-                logger.warning("llm_error_fallback", extra={"gap_analysis_id": str(gap_analysis_id), "error": str(exc)})
+                logger.warning(
+                    "llm_error_fallback",
+                    extra={"gap_analysis_id": str(gap_analysis_id), "error": sanitize_for_log(exc)},
+                )
             try:
                 local = LocalLLMProvider(
                     base_url=settings.local_llm_base_url,
                     model=settings.local_llm_model,
                 )
-                await run_gap_analysis_ai(session, analysis.id, local, prompt, fallback_from="primary")
+                await _run_with_new_session(local, fallback_from="primary")
                 return
             except Exception:  # noqa: BLE001
                 fallback = HeuristicProvider()
-                await run_gap_analysis_ai(session, analysis.id, fallback, prompt, fallback_from="primary_or_local")
+                await _run_with_new_session(fallback, fallback_from="primary_or_local")
                 return
         except Exception as exc:  # noqa: BLE001
-            logger.warning("llm_error_fallback", extra={"gap_analysis_id": str(gap_analysis_id), "error": str(exc)})
+            logger.warning(
+                "llm_error_fallback",
+                extra={"gap_analysis_id": str(gap_analysis_id), "error": sanitize_for_log(exc)},
+            )
             try:
                 local = LocalLLMProvider(
                     base_url=settings.local_llm_base_url,
                     model=settings.local_llm_model,
                 )
-                await run_gap_analysis_ai(session, analysis.id, local, prompt, fallback_from="primary")
+                await _run_with_new_session(local, fallback_from="primary")
                 return
             except Exception:  # noqa: BLE001
                 fallback = HeuristicProvider()
-                await run_gap_analysis_ai(session, analysis.id, fallback, prompt, fallback_from="primary_or_local")
+                await _run_with_new_session(fallback, fallback_from="primary_or_local")
                 return
+    finally:
+        async with _INFLIGHT_GUARD:
+            _INFLIGHT_IDS.discard(key)
 logger = logging.getLogger("app.llm_service")

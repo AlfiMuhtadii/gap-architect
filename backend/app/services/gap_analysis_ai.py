@@ -9,12 +9,13 @@ from typing import Any, Protocol
 from uuid import UUID
 
 from pydantic import BaseModel, ValidationError, field_validator, conlist, Field
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.models.gap import GapAnalysis, GapAnalysisStatus, GapResult, LlmRun, LlmRunStatus
 from app.core.config import settings
+from app.services.log_sanitize import sanitize_for_log
 from app.services.skill_matcher import match_skills
 
 logger = logging.getLogger("app.gap_analysis_ai")
@@ -25,7 +26,7 @@ class LlmProvider(Protocol):
     model: str
     last_usage: dict[str, Any] | None
 
-    async def generate(self, prompt: str) -> str:
+    async def generate(self, prompt: str, *, temperature: float | None = None) -> str:
         ...
 
 
@@ -105,6 +106,53 @@ class LlmCallError(RuntimeError):
     pass
 
 
+def _flatten_exception_messages(exc: BaseException) -> list[str]:
+    messages: list[str] = []
+    seen: set[int] = set()
+
+    def _walk(err: BaseException | None) -> None:
+        if err is None:
+            return
+        ident = id(err)
+        if ident in seen:
+            return
+        seen.add(ident)
+
+        if hasattr(err, "exceptions") and isinstance(getattr(err, "exceptions"), tuple):
+            for child in getattr(err, "exceptions"):
+                if isinstance(child, BaseException):
+                    _walk(child)
+
+        text = str(err).strip()
+        if text and text not in messages:
+            messages.append(text)
+
+        cause = getattr(err, "__cause__", None)
+        if isinstance(cause, BaseException):
+            _walk(cause)
+        context = getattr(err, "__context__", None)
+        if isinstance(context, BaseException):
+            _walk(context)
+
+    _walk(exc)
+    return messages
+
+
+def _exception_contains_token(exc: BaseException, token: str) -> bool:
+    token_lower = token.lower()
+    for msg in _flatten_exception_messages(exc):
+        if token_lower in msg.lower():
+            return True
+    return False
+
+
+def _exception_summary(exc: BaseException) -> str:
+    msgs = _flatten_exception_messages(exc)
+    if msgs:
+        return " | ".join(msgs[:3])
+    return exc.__class__.__name__
+
+
 def _estimate_cost_usd(model: str, usage: dict[str, Any] | None) -> float | None:
     if not usage:
         return None
@@ -142,12 +190,48 @@ def _parse_json(raw: str) -> dict[str, Any]:
             if text.strip().lower().startswith("json"):
                 text = text.strip()[4:]
             text = text.strip()
-    data = json.loads(text)
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError:
+        extracted = _extract_first_json_object(text)
+        if not extracted:
+            raise
+        data = json.loads(extracted)
     if isinstance(data, dict) and isinstance(data.get("raw"), str):
         return _parse_json(data["raw"])
     if not isinstance(data, dict):
         raise ValueError("response must be a JSON object")
     return data
+
+
+def _extract_first_json_object(text: str) -> str | None:
+    start = text.find("{")
+    if start < 0:
+        return None
+    depth = 0
+    in_string = False
+    escape = False
+    for idx in range(start, len(text)):
+        ch = text[idx]
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+            continue
+        if ch == "{":
+            depth += 1
+            continue
+        if ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : idx + 1]
+    return None
 
 
 def _fallback_roadmap_markdown(missing_skills: list[str], steps: list[dict[str, str]]) -> str:
@@ -339,20 +423,41 @@ def _coerce_local_payload(parsed: dict[str, Any]) -> None:
         parsed["top_priority_skills"] = _to_str_list(parsed.get("top_priority_skills"))[:3]
 
 
-def _filter_missing_against_jd_and_resume(
-    missing: list[str], jd_text: str, resume_text: str
-) -> list[str]:
-    jd_lower = jd_text.lower()
-    resume_lower = resume_text.lower()
-    filtered: list[str] = []
-    for skill in missing:
-        s = str(skill).strip()
-        if not s:
-            continue
-        s_lower = s.lower()
-        if s_lower in jd_lower and s_lower not in resume_lower:
-            filtered.append(s)
-    return filtered
+async def _build_validation_fallback_message(
+    analysis: GapAnalysis,
+    *,
+    failure_case: str,
+) -> str:
+    try:
+        missing, *_ = match_skills(
+            resume_text=analysis.resume_text,
+            jd_text=analysis.jd_text,
+        )
+    except Exception:  # noqa: BLE001
+        missing = []
+    sample = [s for s in (missing or []) if str(s).strip()][:3]
+    case_messages = {
+        "invalid_json_after_retry": (
+            "The AI returned malformed JSON twice, so the analysis result could not be parsed."
+        ),
+        "schema_validation_failed_after_retry": (
+            "The AI returned an output that did not match the required schema after one repair attempt."
+        ),
+        "schema_validation_failed": (
+            "The AI returned an output that did not match the required schema."
+        ),
+    }
+    lead = case_messages.get(
+        failure_case,
+        "The analysis response failed validation.",
+    )
+    if sample:
+        return (
+            f"{lead} Interim deterministic signal suggests missing skills: "
+            + ", ".join(sample)
+            + ". Please retry in a moment."
+        )
+    return f"{lead} Please retry in a moment."
 
 
 def _validate_roadmap_markdown(text: str) -> None:
@@ -448,22 +553,6 @@ def _repair_prompt(base_prompt: str, raw_response: str, error: str) -> str:
     )
 
 
-def _rank_prompt(missing_skills: list[str], jd_text: str) -> str:
-    skills = ", ".join(missing_skills)
-    if len(jd_text) > settings.max_prompt_chars:
-        jd_text = jd_text[: settings.max_prompt_chars]
-    return (
-        "You are ranking missing skills by importance for the target job description.\n"
-        f"Job description:\n{jd_text}\n\n"
-        f"Missing skills: {skills}\n\n"
-        "Return ONLY valid JSON with this exact schema:\n"
-        "{\"ranked\": [\"skill1\", \"skill2\", \"skill3\"]}\n"
-        "Rules:\n"
-        "- Output exactly 3 items.\n"
-        "- Each item must be copied from the Missing skills list.\n"
-    )
-
-
 def _infer_context(jd_text: str) -> str:
     jd = jd_text.lower()
     tags: list[str] = []
@@ -512,39 +601,25 @@ def _build_interview_questions(missing_skills: list[str], jd_text: str) -> list[
     return questions
 
 
-def _count_skill_occurrences(skill: str, jd_text: str) -> int:
-    import re
-
-    tokens = re.findall(r"[a-z0-9\+\#\-\.]+", skill.lower())
-    if not tokens:
-        return 0
-    if len(tokens) == 1:
-        pattern = r"\b" + re.escape(tokens[0]) + r"\b"
-        return len(re.findall(pattern, jd_text.lower()))
-    phrase = r"\b" + r"\s+".join(re.escape(t) for t in tokens) + r"\b"
-    return len(re.findall(phrase, jd_text.lower()))
-
-
 async def _pre_rank_missing_skills(
     session: AsyncSession, missing_skills: list[str], jd_text: str
 ) -> list[str]:
     if not missing_skills:
         return []
-    import re
-    scored: list[tuple[float, int, str]] = []
-    stopwords = {"and", "or", "the", "a", "an", "of", "to", "in", "on", "for", "with", "by", "at"}
+    scored: list[tuple[int, int, int, str]] = []
+    jd = jd_text.lower()
     for idx, skill in enumerate(missing_skills):
-        tokens = re.findall(r"[a-z0-9\+\#\-\.]+", skill.lower())
-        if not tokens:
+        s = str(skill).strip()
+        if not s:
             continue
-        if len(tokens) == 1 and (tokens[0] in stopwords or len(tokens[0]) < 3):
-            continue
-        freq = _count_skill_occurrences(skill, jd_text)
-        length_bonus = min(len(skill) / 10.0, 2.0)
-        score = (freq * 2.0) + length_bonus
-        scored.append((score, idx, skill))
-    scored.sort(key=lambda x: (-x[0], x[1]))
-    return [s for _, _, s in scored]
+        s_lower = s.lower()
+        freq = jd.count(s_lower)
+        first_pos = jd.find(s_lower)
+        if first_pos < 0:
+            first_pos = 10**9
+        scored.append((freq, first_pos, idx, s))
+    scored.sort(key=lambda x: (-x[0], x[1], x[2]))
+    return [s for _, _, _, s in scored]
 
 
 async def _rank_missing_skills(
@@ -555,34 +630,6 @@ async def _rank_missing_skills(
 
 
 
-async def _llm_classify_skills(
-    provider: LlmProvider,
-    skills: list[str],
-) -> tuple[list[str], list[str]] | None:
-    if getattr(provider, "name", "") == "heuristic":
-        return None
-    if getattr(provider, "name", "") == "local_llm":
-        return None
-    if not skills:
-        return [], []
-    prompt = (
-        "Classify the following skills into hard vs soft.\n"
-        "Return ONLY valid JSON with this schema:\n"
-        "{\"hard\": [\"...\"], \"soft\": [\"...\"]}\n"
-        "Rules:\n"
-        "- Only use skills from the input list.\n"
-        "- Do not invent new skills.\n\n"
-        f"SKILLS:\n{', '.join(skills)}"
-    )
-    try:
-        raw = await provider.generate(prompt)
-        data = _parse_json(raw)
-        hard = [str(s).strip() for s in data.get("hard", []) if str(s).strip() in skills]
-        soft = [str(s).strip() for s in data.get("soft", []) if str(s).strip() in skills]
-        return list(dict.fromkeys(hard)), list(dict.fromkeys(soft))
-    except Exception:
-        return None
-
 async def run_gap_analysis_ai(
     session: AsyncSession,
     gap_analysis_id: UUID,
@@ -590,13 +637,14 @@ async def run_gap_analysis_ai(
     prompt: str,
     *,
     fallback_from: str | None = None,
+    raise_on_provider_failure: bool = False,
 ) -> None:
     try:
         analysis = (await session.execute(select(GapAnalysis).where(GapAnalysis.id == gap_analysis_id))).scalars().first()
     except SQLAlchemyError as e:
         logger.error(
             f"Database error fetching gap_analysis {gap_analysis_id}",
-            extra={"gap_analysis_id": str(gap_analysis_id), "error": str(e)},
+            extra={"gap_analysis_id": str(gap_analysis_id), "error": sanitize_for_log(e)},
             exc_info=True,
         )
         raise ValueError(f"Database error: {e}") from e
@@ -612,27 +660,35 @@ async def run_gap_analysis_ai(
             else settings.llm_timeout_seconds
         )
 
-    async def _call_llm(call_prompt: str) -> tuple[dict[str, Any] | None, str | None, int, int]:
+    async def _call_llm(
+        call_prompt: str,
+        *,
+        temperature: float | None = None,
+    ) -> tuple[dict[str, Any] | None, str | None, int, int]:
         start = time.perf_counter()
         attempts = 0
         while True:
             attempts += 1
             try:
-                raw = await asyncio.wait_for(provider.generate(call_prompt), timeout=_provider_timeout())
+                try:
+                    gen_coro = provider.generate(call_prompt, temperature=temperature)
+                except TypeError:
+                    gen_coro = provider.generate(call_prompt)
+                raw = await asyncio.wait_for(gen_coro, timeout=_provider_timeout())
                 break
             except Exception as exc:  # noqa: BLE001
-                is_timeout = "timeout" in (str(exc) or "").lower()
+                is_timeout = _exception_contains_token(exc, "timeout")
                 if attempts < 2 and is_timeout:
                     continue
                 duration_ms = int((time.perf_counter() - start) * 1000)
-                error_text = str(exc) or repr(exc)
+                error_text = _exception_summary(exc)
                 raise LlmCallError(error_text) from exc
 
         duration_ms = int((time.perf_counter() - start) * 1000)
         try:
             parsed = _parse_json(raw)
         except Exception as exc:  # noqa: BLE001
-            error_text = str(exc) or repr(exc)
+            error_text = _exception_summary(exc)
             return None, error_text, duration_ms, attempts
 
         return parsed, None, duration_ms, attempts
@@ -643,7 +699,7 @@ async def run_gap_analysis_ai(
             if getattr(provider, "name", "") == "local_llm":
                 raise ValueError("local_invalid_json")
             repaired_prompt = _repair_prompt(prompt, "", error or "invalid JSON")
-            parsed, error, duration_ms, attempts = await _call_llm(repaired_prompt)
+            parsed, error, duration_ms, attempts = await _call_llm(repaired_prompt, temperature=0.2)
             if parsed is None:
                 meta = {
                     "retry_attempts": attempts,
@@ -660,7 +716,11 @@ async def run_gap_analysis_ai(
                     error_message=error or "invalid JSON after repair",
                     duration_ms=duration_ms,
                 )
-                await _mark_failed_validation(session, analysis, error or "invalid JSON after repair")
+                friendly = await _build_validation_fallback_message(
+                    analysis,
+                    failure_case="invalid_json_after_retry",
+                )
+                await _mark_failed_validation(session, analysis, friendly)
                 return
 
         if getattr(provider, "name", "") == "local_llm":
@@ -687,7 +747,7 @@ async def run_gap_analysis_ai(
                 except ValidationError as exc_local:
                     raise ValueError("local_invalid_json") from exc_local
             repaired_prompt = _repair_prompt(prompt, json.dumps(parsed, ensure_ascii=True), str(exc))
-            parsed2, error2, duration_ms, attempts = await _call_llm(repaired_prompt)
+            parsed2, error2, duration_ms, attempts = await _call_llm(repaired_prompt, temperature=0.2)
             if parsed2 is None:
                 meta = {
                     "retry_attempts": attempts,
@@ -704,13 +764,39 @@ async def run_gap_analysis_ai(
                     error_message=error2 or "invalid JSON after repair",
                     duration_ms=duration_ms,
                 )
-                await _mark_failed_validation(session, analysis, error2 or "invalid JSON after repair")
+                friendly = await _build_validation_fallback_message(
+                    analysis,
+                    failure_case="invalid_json_after_retry",
+                )
+                await _mark_failed_validation(session, analysis, friendly)
                 return
             try:
                 validated = GapAnalysisAIResult.model_validate(parsed2)
                 parsed = parsed2
             except ValidationError as exc2:
-                await _mark_failed_validation(session, analysis, str(exc2))
+                meta = {
+                    "retry_attempts": attempts,
+                    "fallback_from": fallback_from,
+                }
+                await _log_llm_run(
+                    session=session,
+                    gap_analysis_id=gap_analysis_id,
+                    provider=provider.name,
+                    model=provider.model,
+                    request_hash=_hash_prompt(repaired_prompt),
+                    response_json={
+                        "error": _exception_summary(exc2) or "schema_validation_failed_after_repair",
+                        "_meta": meta,
+                    },
+                    status=LlmRunStatus.FAILED,
+                    error_message=_exception_summary(exc2) or "schema_validation_failed_after_repair",
+                    duration_ms=duration_ms,
+                )
+                friendly = await _build_validation_fallback_message(
+                    analysis,
+                    failure_case="schema_validation_failed_after_retry",
+                )
+                await _mark_failed_validation(session, analysis, friendly)
                 return
         usage = getattr(provider, "last_usage", None) or {}
         meta = {
@@ -721,26 +807,30 @@ async def run_gap_analysis_ai(
         }
         parsed_for_log = dict(parsed)
         parsed_for_log["_meta"] = meta
-        await _log_llm_run(
-            session=session,
-            gap_analysis_id=gap_analysis_id,
-            provider=provider.name,
-            model=provider.model,
-            request_hash=_hash_prompt(prompt),
-            response_json=parsed_for_log,
-            status=LlmRunStatus.SUCCESS,
-            error_message=None,
-            duration_ms=duration_ms,
-        )
-
         try:
-            await _persist_success(session, analysis, validated, provider)
+            persisted = await _persist_success(session, analysis, validated, provider)
+            if not persisted:
+                await session.rollback()
+                return
+            await _log_llm_run(
+                session=session,
+                gap_analysis_id=gap_analysis_id,
+                provider=provider.name,
+                model=provider.model,
+                request_hash=_hash_prompt(prompt),
+                response_json=parsed_for_log,
+                status=LlmRunStatus.SUCCESS,
+                error_message=None,
+                duration_ms=duration_ms,
+            )
+            await session.commit()
         except Exception as exc:  # noqa: BLE001
+            await session.rollback()
             await session.refresh(analysis)
             if analysis.status == GapAnalysisStatus.DONE:
                 return
             analysis.status = GapAnalysisStatus.FAILED_LLM
-            analysis.error_message = str(exc)[:1000]
+            analysis.error_message = sanitize_for_log(exc, max_len=1000)
             await session.commit()
             return
     except LlmCallError as exc:
@@ -765,13 +855,13 @@ async def run_gap_analysis_ai(
             if "timeout" in str(exc).lower():
                 raise ValueError("local_timeout") from exc
             raise ValueError("local_llm_failed") from exc
-        if getattr(provider, "name", "") != "heuristic":
+        if getattr(provider, "name", "") != "heuristic" and raise_on_provider_failure:
             raise ValueError("llm_failed") from exc
         await session.refresh(analysis)
         if analysis.status == GapAnalysisStatus.DONE:
             return
         analysis.status = GapAnalysisStatus.FAILED_LLM
-        analysis.error_message = str(exc)
+        analysis.error_message = sanitize_for_log(exc, max_len=1000)
         await session.commit()
 
 
@@ -780,19 +870,18 @@ async def _persist_success(
     analysis: GapAnalysis,
     result: GapAnalysisAIResult,
     provider: LlmProvider,
-) -> None:
-    override = analysis.jd_skills_override if isinstance(analysis.jd_skills_override, list) else None
-    missing, match_percent, match_reason, top, *_ = await match_skills(
+) -> bool:
+    matcher_missing, match_percent, match_reason, top = match_skills(
         resume_text=analysis.resume_text,
         jd_text=analysis.jd_text,
-        jd_skills_override=override,
     )
+    # Deterministic source of truth for gap math + missing skill list.
+    # LLM remains generative-only (steps/questions/roadmap).
+    missing = matcher_missing
     use_matcher = getattr(provider, "name", "") == "heuristic"
     if getattr(provider, "name", "") != "heuristic":
-        missing = result.missing_skills
-        match_percent = result.match_percent
-        match_reason = result.match_reason
-        top = result.top_priority_skills
+        # Keep LLM priority suggestions when present, fallback to matcher top.
+        top = result.top_priority_skills or top
 
     if use_matcher:
         ranked = await _rank_missing_skills(session, missing, analysis.jd_text)
@@ -897,37 +986,33 @@ async def _persist_success(
         match_reason=match_reason,
         top_priority_skills=top,
     )
-    await session.refresh(analysis)
-    if analysis.status == GapAnalysisStatus.DONE and analysis.gap_result is not None:
-        return
-    analysis.status = GapAnalysisStatus.DONE
-    analysis.error_message = None
+
+    # CAS: only one worker may transition PENDING -> DONE and persist success artifacts.
+    transition = await session.execute(
+        update(GapAnalysis)
+        .where(
+            GapAnalysis.id == analysis.id,
+            GapAnalysis.status == GapAnalysisStatus.PENDING,
+        )
+        .values(
+            status=GapAnalysisStatus.DONE,
+            error_message=None,
+        )
+    )
+    rowcount = transition.rowcount
+    # Some dialects (notably SQLite in async mode) may report -1 for unknown rowcount.
+    # Treat only explicit 0 as "not claimed".
+    if rowcount is not None and int(rowcount) == 0:
+        return False
+
     session.add(gap_result)
-    try:
-        await session.commit()
-    except Exception:  # noqa: BLE001
-        await session.rollback()
-        existing = (
-            await session.execute(
-                select(GapResult).where(GapResult.gap_analysis_id == analysis.id)
-            )
-        ).scalars().first()
-        if existing is not None:
-            await session.refresh(analysis)
-            analysis.status = GapAnalysisStatus.DONE
-            analysis.error_message = None
-            await session.commit()
-            return
-        raise
+    return True
 
 
 async def _mark_failed_validation(session: AsyncSession, analysis: GapAnalysis, error_message: str) -> None:
-    await session.refresh(analysis)
-    if analysis.status == GapAnalysisStatus.DONE:
-        return
-    analysis.status = GapAnalysisStatus.FAILED_VALIDATION
+    safe_message = sanitize_for_log(error_message, max_len=1000)
     original_length = len(error_message)
-    truncated_message = error_message[:1000]
+    truncated_message = safe_message
     if original_length > 1000:
         logger.warning(
             f"Error message truncated for gap_analysis {analysis.id}",
@@ -937,7 +1022,14 @@ async def _mark_failed_validation(session: AsyncSession, analysis: GapAnalysis, 
                 "truncated_length": len(truncated_message),
             },
         )
-    analysis.error_message = truncated_message
+    await session.execute(
+        update(GapAnalysis)
+        .where(GapAnalysis.id == analysis.id, GapAnalysis.status != GapAnalysisStatus.DONE)
+        .values(
+            status=GapAnalysisStatus.FAILED_VALIDATION,
+            error_message=truncated_message,
+        )
+    )
     await session.commit()
 
 
@@ -964,4 +1056,3 @@ async def _log_llm_run(
         duration_ms=duration_ms,
     )
     session.add(run)
-    await session.flush()

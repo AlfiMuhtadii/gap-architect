@@ -10,7 +10,6 @@ class GapAnalysisCreate(BaseModel):
     jd_text: str = Field(min_length=1, max_length=settings.max_jd_chars)
     model: str = Field(min_length=1)
     prompt_version: str = Field(min_length=1)
-    jd_skills_override: list[str] | None = None
 
     @field_validator("resume_text", "jd_text", mode="before")
     @classmethod
@@ -35,36 +34,26 @@ class GapAnalysisCreate(BaseModel):
             raise ValueError("invalid format")
         return cleaned
 
-    @field_validator("jd_skills_override", mode="before")
-    @classmethod
-    def _normalize_override(cls, v):
-        if v is None:
-            return None
-        if not isinstance(v, list):
-            raise ValueError("must be a list")
-        cleaned = [s.strip() for s in v if isinstance(s, str)]
-        cleaned = [s for s in cleaned if s]
-        if not cleaned:
-            return None
-        # de-dup while preserving order
-        seen = set()
-        uniq = []
-        for s in cleaned:
-            if s.lower() in seen:
-                continue
-            seen.add(s.lower())
-            uniq.append(s)
-        return uniq
+class ActionStepOut(BaseModel):
+    title: str
+    why: str
+    deliverable: str
+
+
+class InterviewQuestionOut(BaseModel):
+    question: str
+    focus_gap: str
+    what_good_looks_like: str
 
 
 class GapResultOut(BaseModel):
-    missing_skills: Any
-    top_priority_skills: list[str] | None = None
-    action_steps: Any
-    interview_questions: Any
+    missing_skills: list[str]
+    action_steps: list[ActionStepOut]
+    interview_questions: list[InterviewQuestionOut]
     roadmap_markdown: str
     match_percent: float | None = None
     match_reason: str | None = None
+    metadata: dict[str, Any] | None = None
     generation_meta: dict[str, Any] | None = None
 
     class Config:
@@ -75,16 +64,21 @@ class GapAnalysisOut(BaseModel):
     id: UUID
     status: GapAnalysisStatus
     result: GapResultOut | None = None
+    error_message: str | None = None
 
     class Config:
         from_attributes = True
 
 
-class SkillDetectRequest(BaseModel):
+class InputValidationRequest(BaseModel):
     resume_text: str = Field(min_length=1, max_length=settings.max_resume_chars)
     jd_text: str = Field(min_length=1, max_length=settings.max_jd_chars)
 
 
-class SkillDetectResponse(BaseModel):
-    jd_skills: list[str]
-    resume_skills: list[str]
+class InputValidationResponse(BaseModel):
+    is_valid: bool
+    error_message: str | None = None
+    resume_word_count: int
+    jd_word_count: int
+    resume_tech_entities: int
+    jd_tech_entities: int

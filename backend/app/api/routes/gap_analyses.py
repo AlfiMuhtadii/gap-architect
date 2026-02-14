@@ -5,12 +5,11 @@ from app.api.deps import get_async_session
 from app.schemas.gap_analysis import (
     GapAnalysisCreate,
     GapAnalysisOut,
-    SkillDetectRequest,
-    SkillDetectResponse,
+    InputValidationRequest,
+    InputValidationResponse,
 )
 from app.models.gap import GapAnalysisStatus
-from app.services.skill_matcher import detect_skills
-from app.services.gap_analysis_service import create_or_get_gap_analysis, get_gap_analysis
+from app.services.gap_analysis_service import create_or_get_gap_analysis, get_gap_analysis, validate_input_quality
 
 
 router = APIRouter()
@@ -31,10 +30,9 @@ async def create_gap_analysis(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
-@router.post("/gap-analyses/detect-skills", response_model=SkillDetectResponse)
-async def detect_gap_skills(payload: SkillDetectRequest) -> SkillDetectResponse:
-    jd_skills, resume_skills = await detect_skills(payload.resume_text, payload.jd_text)
-    return SkillDetectResponse(jd_skills=jd_skills, resume_skills=resume_skills)
+@router.post("/gap-analyses/validate-input", response_model=InputValidationResponse)
+async def validate_gap_input(payload: InputValidationRequest) -> InputValidationResponse:
+    return validate_input_quality(payload.resume_text, payload.jd_text)
 
 
 @router.get("/gap-analyses/{gap_analysis_id}", response_model=GapAnalysisOut)

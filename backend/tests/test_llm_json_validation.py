@@ -3,7 +3,7 @@ import pytest
 from sqlalchemy import select
 
 from app.models.gap import GapAnalysis, GapAnalysisStatus, GapResult
-from app.services.gap_analysis_ai import run_gap_analysis_ai
+from app.services.gap_analysis_ai import run_gap_analysis_ai, _parse_json
 from .factories import make_gap_analysis
 
 
@@ -70,3 +70,26 @@ async def test_llm_json_invalid_retry_then_failed_validation(db_session):
     row = (await db_session.execute(select(GapAnalysis).where(GapAnalysis.id == analysis.id))).scalars().first()
     assert row.status == GapAnalysisStatus.FAILED_VALIDATION
     assert provider.calls == 2
+
+
+def test_parse_json_with_fenced_block_and_prefix_suffix():
+    raw = (
+        "Here is output:\n"
+        "```json\n"
+        "{\"missing_skills\":[],\"action_steps\":[],\"interview_questions\":[],\"roadmap_markdown\":\"x\",\"match_percent\":0,\"match_reason\":\"m\"}\n"
+        "```\n"
+        "thanks"
+    )
+    data = _parse_json(raw)
+    assert isinstance(data, dict)
+    assert "missing_skills" in data
+
+
+def test_parse_json_extracts_embedded_object_when_not_pure_json():
+    raw = (
+        "Model preface... "
+        "{\"missing_skills\":[\"rust\"],\"action_steps\":[],\"interview_questions\":[],\"roadmap_markdown\":\"x\",\"match_percent\":0,\"match_reason\":\"m\"} "
+        "trailing notes"
+    )
+    data = _parse_json(raw)
+    assert data["missing_skills"] == ["rust"]

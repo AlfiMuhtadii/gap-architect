@@ -17,6 +17,11 @@ class LlmRunStatus(str, enum.Enum):
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
 
+
+class JdCleanStatus(str, enum.Enum):
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+
 class GapAnalysis(Base):
     __tablename__ = "gap_analyses"
 
@@ -30,7 +35,6 @@ class GapAnalysis(Base):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     model: Mapped[str] = mapped_column(String(255), nullable=False)
     prompt_version: Mapped[str] = mapped_column(String(255), nullable=False)
-    jd_skills_override: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
@@ -84,4 +88,20 @@ class LlmRun(Base):
 
     __table_args__ = (
         Index("ix_llm_runs_created_at", "created_at"),
+    )
+
+
+class JdCleanRun(Base):
+    __tablename__ = "jd_clean_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    input_hash: Mapped[str] = mapped_column(CHAR(64), nullable=False, unique=True, index=True)
+    clean_strategy: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[JdCleanStatus] = mapped_column(
+        Enum(JdCleanStatus, name="jd_clean_status"), nullable=False, index=True
+    )
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
     )

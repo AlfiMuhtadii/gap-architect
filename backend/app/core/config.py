@@ -27,7 +27,6 @@ load_dotenv(_base_dir.parent / ".env")
 class Settings(BaseModel):
     app_name: str = os.getenv("APP_NAME", "gap-architect")
     api_v1_str: str = os.getenv("API_V1_STR", "/api/v1")
-    debug: bool = os.getenv("DEBUG", "false").lower() == "true"
 
     postgres_host: str = _getenv_nonempty("POSTGRES_HOST") or "localhost"
     postgres_port: str = _getenv_nonempty("POSTGRES_PORT") or "5432"
@@ -65,22 +64,17 @@ class Settings(BaseModel):
     rate_limit_max_keys: int = int(os.getenv("RATE_LIMIT_MAX_KEYS", "10000"))
     rate_limit_key_header: str = os.getenv("RATE_LIMIT_KEY_HEADER", "")
     redis_url: str = os.getenv("REDIS_URL", "")
-    llm_provider: str = os.getenv("LLM_PROVIDER", "heuristic")
-    llm_api_key: str = os.getenv("LLM_API_KEY", os.getenv("OPENAI_API_KEY", ""))
-    llm_base_url: str = os.getenv("LLM_BASE_URL", os.getenv("OPENAI_BASE_URL", "https://api.openai.com"))
-    llm_model: str = os.getenv("LLM_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini"))
-    openai_api_key: str = os.getenv("OPENAI_API_KEY", "")
-    openai_base_url: str = os.getenv("OPENAI_BASE_URL", "https://api.openai.com")
-    openai_model: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    llm_provider: str = os.getenv("LLM_PROVIDER", "compatible")
+    llm_api_key: str = os.getenv("LLM_API_KEY", "")
+    llm_base_url: str = os.getenv("LLM_BASE_URL", "https://router.huggingface.co")
+    llm_model: str = os.getenv("LLM_MODEL", "meta-llama/Meta-Llama-3-8B-Instruct")
     local_llm_base_url: str = os.getenv("LOCAL_LLM_BASE_URL", "http://localhost:11434")
     local_llm_model: str = os.getenv("LOCAL_LLM_MODEL", "llama3.1")
-    _base_dir: Path = _base_dir
+    max_concurrent_gap_jobs: int = int(os.getenv("MAX_CONCURRENT_GAP_JOBS", "4"))
     canonical_skills_path: str = os.getenv(
         "CANONICAL_SKILLS_PATH",
         str(_base_dir / "datasets" / "canonical_skills.txt"),
     )
-    translate_enabled: bool = os.getenv("TRANSLATE_ENABLED", "false").lower() == "true"
-    translate_target_lang: str = os.getenv("TRANSLATE_TARGET_LANG", "en")
     max_prompt_chars: int = int(os.getenv("MAX_PROMPT_CHARS", "60000"))
 
 
