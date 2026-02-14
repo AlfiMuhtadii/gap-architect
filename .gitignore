@@ -7,8 +7,10 @@ Thumbs.db
 # Env files
 .env
 .env.*
-!.env.example
-!backend/.env.example
+!.env.dev.example
+!.env.prod.example
+!backend/.env.dev.example
+!frontend/.env.dev.example
 
 # Logs
 *.log

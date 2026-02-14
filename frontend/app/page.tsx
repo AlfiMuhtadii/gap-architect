@@ -6,7 +6,6 @@ import { apiGet, apiPost } from "@/lib/api";
 
 type GapResult = {
   missing_skills: string[];
-  top_priority_skills: string[];
   action_steps: { title: string; why: string; deliverable: string }[];
   interview_questions: {
     question: string;
@@ -21,11 +20,57 @@ type GapResult = {
 type GapAnalysisResponse = {
   id: string;
   status: "PENDING" | "DONE" | "FAILED_VALIDATION" | "FAILED_LLM";
+  error_message?: string | null;
   result?: GapResult | null;
+};
+
+type InputValidationResponse = {
+  is_valid: boolean;
+  error_message?: string | null;
+  resume_word_count: number;
+  jd_word_count: number;
+  resume_tech_entities: number;
+  jd_tech_entities: number;
 };
 
 const DEFAULT_MODEL = "gpt-4o-mini";
 const DEFAULT_PROMPT_VERSION = "v1";
+
+function toUserMessage(error: unknown, fallback: string): string {
+  const raw = error instanceof Error ? error.message : "";
+  if (!raw) return fallback;
+  const normalized = raw.toLowerCase();
+  if (normalized.includes("failed to fetch")) {
+    return "Cannot reach server. Check backend connection and try again.";
+  }
+  if (normalized.startsWith("api error: 5")) {
+    return "Server is busy right now. Please retry in a moment.";
+  }
+  if (normalized.startsWith("api error: 4")) {
+    return raw;
+  }
+  return raw;
+}
+
+function countWords(text: string): number {
+  return (text.match(/\b\w+\b/g) ?? []).length;
+}
+
+function countTechEntities(text: string): number {
+  const terms = [
+    "python","java","javascript","typescript","golang","go","rust","kotlin","scala",
+    "sql","postgresql","mysql","mongodb","redis","docker","kubernetes","aws","gcp","azure",
+    "react","next.js","nextjs","node.js","nodejs","fastapi","django","flask","spring","terraform"
+  ];
+  const lowered = text.toLowerCase();
+  const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const found = new Set<string>();
+  for (const term of terms) {
+    const pattern = new RegExp(`(?<![a-z0-9])${esc(term)}(?![a-z0-9])`, "i");
+    if (pattern.test(lowered)) found.add(term);
+  }
+  return found.size;
+}
 
 export default function HomePage() {
   const [resumeText, setResumeText] = useState("");
@@ -36,14 +81,17 @@ export default function HomePage() {
   const [lookupId, setLookupId] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const [jdSkills, setJdSkills] = useState<string[]>([]);
-  const [resumeSkills, setResumeSkills] = useState<string[]>([]);
-  const [selectedSkills, setSelectedSkills] = useState<string[]>([]);
+  const [validation, setValidation] = useState<InputValidationResponse | null>(null);
+  const [validationError, setValidationError] = useState<string | null>(null);
+  const canSubmit = Boolean(resumeText.trim() && jdText.trim() && validation?.is_valid);
 
   const fetchStatus = useCallback(async (id: string) => {
     const data = await apiGet<GapAnalysisResponse>(`/api/v1/gap-analyses/${id}`);
     setStatus(data.status);
     setResult(data.result ?? null);
+    if ((data.status === "FAILED_VALIDATION" || data.status === "FAILED_LLM") && data.error_message) {
+      setError(data.error_message);
+    }
     return data.status;
   }, []);
 
@@ -54,14 +102,53 @@ export default function HomePage() {
         const s = await fetchStatus(analysisId);
         if (s !== "PENDING") clearInterval(timer);
       } catch (e) {
-        setError("Failed to fetch status");
+        setError(toUserMessage(e, "Failed to fetch analysis status."));
         clearInterval(timer);
       }
     }, 1500);
     return () => clearInterval(timer);
   }, [analysisId, status, fetchStatus]);
 
+  useEffect(() => {
+    if (!resumeText.trim() || !jdText.trim()) {
+      setValidation(null);
+      setValidationError(null);
+      return;
+    }
+    const timer = setTimeout(async () => {
+      try {
+        const data = await apiPost<InputValidationResponse>("/api/v1/gap-analyses/validate-input", {
+          resume_text: resumeText,
+          jd_text: jdText,
+        });
+        setValidation(data);
+        setValidationError(null);
+      } catch (e) {
+        setValidation(null);
+        setValidationError(toUserMessage(e, "Unable to validate input right now. Please retry."));
+      }
+    }, 300);
+    return () => clearTimeout(timer);
+  }, [resumeText, jdText]);
+
   const onSubmit = async () => {
+    let gate: InputValidationResponse;
+    try {
+      gate = await apiPost<InputValidationResponse>("/api/v1/gap-analyses/validate-input", {
+        resume_text: resumeText,
+        jd_text: jdText,
+      });
+      setValidation(gate);
+      setValidationError(null);
+    } catch (e) {
+      setValidation(null);
+      setValidationError(toUserMessage(e, "Unable to validate input right now. Please retry."));
+      return;
+    }
+    if (!gate.is_valid) {
+      setError(gate.error_message ?? "Input validation failed");
+      return;
+    }
     setError(null);
     setResult(null);
     setStatus(null);
@@ -71,15 +158,17 @@ export default function HomePage() {
         resume_text: resumeText,
         jd_text: jdText,
         model: DEFAULT_MODEL,
-        prompt_version: DEFAULT_PROMPT_VERSION,
-        jd_skills_override: selectedSkills.length ? selectedSkills : null
+        prompt_version: DEFAULT_PROMPT_VERSION
       });
       setAnalysisId(data.id);
       setStatus(data.status);
       setResult(data.result ?? null);
+      if ((data.status === "FAILED_VALIDATION" || data.status === "FAILED_LLM") && data.error_message) {
+        setError(data.error_message);
+      }
       setIsSubmitting(false);
     } catch (e) {
-      setError("Submission failed");
+      setError(toUserMessage(e, "Submission failed. Please retry."));
       setIsSubmitting(false);
     }
   };
@@ -92,23 +181,11 @@ export default function HomePage() {
       setAnalysisId(data.id);
       setStatus(data.status);
       setResult(data.result ?? null);
+      if ((data.status === "FAILED_VALIDATION" || data.status === "FAILED_LLM") && data.error_message) {
+        setError(data.error_message);
+      }
     } catch (e) {
-      setError("Analysis ID not found");
-    }
-  };
-
-  const onDetectSkills = async () => {
-    setError(null);
-    try {
-      const data = await apiPost<{ jd_skills: string[]; resume_skills: string[] }>(
-        "/api/v1/gap-analyses/detect-skills",
-        { resume_text: resumeText, jd_text: jdText }
-      );
-      setJdSkills(data.jd_skills);
-      setResumeSkills(data.resume_skills);
-      setSelectedSkills(data.jd_skills);
-    } catch (e) {
-      setError("Skill detection failed");
+      setError(toUserMessage(e, "Analysis ID not found."));
     }
   };
 
@@ -272,6 +349,9 @@ export default function HomePage() {
                 onChange={(e) => setResumeText(e.target.value)}
                 placeholder="Paste resume here..."
               />
+              <p className={`text-xs ${validation?.is_valid === false ? "text-[var(--danger)]" : "text-[var(--text-muted)]"}`}>
+                Word count: {validation?.resume_word_count ?? countWords(resumeText)} | Tech entities: {validation?.resume_tech_entities ?? countTechEntities(resumeText)}
+              </p>
             </div>
           </div>
           <div className="rounded-2xl border border-[var(--border)] bg-white/90 p-5 shadow-sm">
@@ -283,37 +363,20 @@ export default function HomePage() {
                 onChange={(e) => setJdText(e.target.value)}
                 placeholder="Paste job description here..."
               />
+              <p className={`text-xs ${validation?.is_valid === false ? "text-[var(--danger)]" : "text-[var(--text-muted)]"}`}>
+                Word count: {validation?.jd_word_count ?? countWords(jdText)} | Tech entities: {validation?.jd_tech_entities ?? countTechEntities(jdText)}
+              </p>
             </div>
           </div>
         </div>
-
-        {jdSkills.length > 0 && (
-          <div className="mt-4 rounded-2xl border border-[var(--border)] bg-white/80 p-5 shadow-sm backdrop-blur">
-            <div className="space-y-3">
-              <h2 className="text-lg font-semibold text-[var(--text)]">Detected JD Skills (HR can edit)</h2>
-              <div className="flex flex-wrap gap-2">
-                {jdSkills.map((skill) => {
-                  const selected = selectedSkills.includes(skill);
-                  return (
-                    <button
-                      key={skill}
-                      onClick={() =>
-                        setSelectedSkills((prev) =>
-                          selected ? prev.filter((s) => s !== skill) : [...prev, skill]
-                        )
-                      }
-                      className={`rounded-full px-3 py-1 text-xs font-semibold ${
-                        selected
-                          ? "bg-emerald-100 text-emerald-800"
-                          : "bg-slate-100 text-slate-700"
-                      }`}
-                    >
-                      {skill}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
+        {validation?.is_valid === false && validation.error_message && (
+          <div className="mt-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">
+            {validation.error_message}
+          </div>
+        )}
+        {validationError && (
+          <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-800">
+            {validationError}
           </div>
         )}
 
@@ -321,16 +384,9 @@ export default function HomePage() {
           <button
             className="rounded-xl bg-[var(--brand)] px-8 py-4 text-base font-semibold text-white shadow-md disabled:opacity-60"
             onClick={onSubmit}
-            disabled={!resumeText.trim() || !jdText.trim() || isSubmitting || status === "PENDING"}
+            disabled={!canSubmit || isSubmitting || status === "PENDING"}
           >
             {status === "PENDING" ? "Processing..." : isSubmitting ? "Submitting..." : "Run Gap Analysis"}
-          </button>
-          <button
-            className="rounded-xl border border-[var(--border)] px-4 py-3 text-sm font-semibold text-[var(--text)] disabled:opacity-60"
-            onClick={onDetectSkills}
-            disabled={!resumeText.trim() || !jdText.trim() || isSubmitting}
-          >
-            Detect Skills
           </button>
           {analysisId && (
             <span className="text-xs text-[var(--text-muted)]">Analysis ID: {analysisId}</span>
@@ -357,7 +413,11 @@ export default function HomePage() {
           </div>
         </div>
 
-        {error && <div className="text-sm text-[var(--danger)]">{error}</div>}
+        {error && (
+          <div className="mt-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">
+            {error}
+          </div>
+        )}
       </section>
 
       {result && (
@@ -376,16 +436,22 @@ export default function HomePage() {
             <div className="rounded-2xl border border-[var(--border)] bg-white/80 p-5 shadow-sm backdrop-blur">
               <div className="mt-1 space-y-3">
                 <h2 className="text-lg font-semibold text-[var(--text)]">Missing Skills</h2>
-                <div className="flex flex-wrap gap-2">
-                  {(result?.missing_skills ?? []).map((skill, i) => (
-                    <span
-                      key={`${skill}-${i}`}
-                      className="fade-in-up rounded-full border border-red-100 bg-red-50 px-3 py-1 text-xs font-semibold text-[var(--danger)]"
-                    >
-                      {skill}
-                    </span>
-                  ))}
-                </div>
+                {result.missing_skills.length === 0 ? (
+                  <div className="rounded-xl border border-emerald-100 bg-emerald-50 px-4 py-3 text-sm font-medium text-emerald-700">
+                    You're a perfect match!
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap gap-2">
+                    {(result?.missing_skills ?? []).map((skill, i) => (
+                      <span
+                        key={`${skill}-${i}`}
+                        className="fade-in-up rounded-full border border-red-100 bg-red-50 px-3 py-1 text-xs font-semibold text-[var(--danger)]"
+                      >
+                        {skill}
+                      </span>
+                    ))}
+                  </div>
+                )}
               </div>
             </div>
 
