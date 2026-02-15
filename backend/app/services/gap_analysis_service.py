@@ -1,4 +1,6 @@
 import hashlib
+import logging
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID
 
@@ -11,6 +13,7 @@ from sqlalchemy.orm import selectinload
 
 from app.models.gap import GapAnalysis, GapAnalysisStatus, GapResult, JdCleanRun, JdCleanStatus, LlmRun
 from app.schemas.gap_analysis import GapAnalysisCreate, GapAnalysisOut, GapResultOut, InputValidationResponse
+from app.core.config import settings
 from app.services import llm_service
 from app.services.input_validation import (
     prepare_texts_for_skill_extraction,
@@ -19,6 +22,10 @@ from app.services.input_validation import (
 )
 from app.services.skill_taxonomy import get_skill_taxonomy_map, normalize_skill_text
 from app.services.text_processing import normalize_text
+
+_LAST_SWEEP_AT: datetime | None = None
+_SWEEP_INTERVAL_SECONDS = 15
+logger = logging.getLogger("app.gap_analysis_service")
 
 
 # Backward-compatible helpers (referenced by existing tests/imports)
@@ -41,6 +48,41 @@ def validate_input_quality(resume_text: str, jd_text: str) -> InputValidationRes
 def _fingerprint(resume_text: str, jd_text: str) -> str:
     payload = f"{resume_text}\n---\n{jd_text}".encode("utf-8")
     return hashlib.sha256(payload).hexdigest()
+
+
+async def _sweep_stuck_pending(session: AsyncSession) -> None:
+    global _LAST_SWEEP_AT
+
+    ttl = int(getattr(settings, "pending_timeout_seconds", 0) or 0)
+    if ttl <= 0:
+        return
+    now = datetime.now(timezone.utc)
+    if _LAST_SWEEP_AT is not None:
+        elapsed = (now - _LAST_SWEEP_AT).total_seconds()
+        if elapsed < _SWEEP_INTERVAL_SECONDS:
+            return
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=ttl)
+    try:
+        await session.execute(
+            update(GapAnalysis)
+            .where(
+                GapAnalysis.status == GapAnalysisStatus.PENDING,
+                GapAnalysis.updated_at < cutoff,
+            )
+            .values(
+                status=GapAnalysisStatus.FAILED_TIMEOUT,
+                error_message="processing_timeout",
+            )
+        )
+        _LAST_SWEEP_AT = now
+    except Exception as exc:  # noqa: BLE001
+        # Fail-open: timeout sweep should never block request flow.
+        logger.warning(
+            "sweep_error_suppressed",
+            extra={"error": str(exc)},
+            exc_info=True,
+        )
+        return
 
 
 async def _upsert_jd_clean_run(
@@ -115,6 +157,7 @@ async def create_or_get_gap_analysis(
     payload: GapAnalysisCreate,
     background_tasks: Optional[BackgroundTasks] = None,
 ) -> GapAnalysisOut:
+    await _sweep_stuck_pending(session)
     raw_resume_norm = _normalize_text(payload.resume_text)
     raw_jd_norm = _normalize_text(payload.jd_text)
     raw_fingerprint = _fingerprint(raw_resume_norm, raw_jd_norm)
@@ -168,12 +211,37 @@ async def create_or_get_gap_analysis(
     if existing and existing.status == GapAnalysisStatus.PENDING:
         return GapAnalysisOut(id=existing.id, status=existing.status, result=None, error_message=existing.error_message)
 
-    if existing and existing.status in (GapAnalysisStatus.FAILED_LLM, GapAnalysisStatus.FAILED_VALIDATION):
+    if existing and existing.status in (
+        GapAnalysisStatus.FAILED_LLM,
+        GapAnalysisStatus.FAILED_VALIDATION,
+        GapAnalysisStatus.FAILED_TIMEOUT,
+    ):
+        cooldown = int(getattr(settings, "retry_cooldown_seconds", 0) or 0)
+        if cooldown > 0 and existing.updated_at is not None:
+            updated_at = existing.updated_at
+            if updated_at.tzinfo is None:
+                updated_at = updated_at.replace(tzinfo=timezone.utc)
+            elapsed = (datetime.now(timezone.utc) - updated_at).total_seconds()
+            if elapsed < cooldown:
+                wait_seconds = max(int(cooldown - elapsed), 1)
+                return GapAnalysisOut(
+                    id=existing.id,
+                    status=existing.status,
+                    result=None,
+                    error_message=f"Retry cooldown active. Please retry in {wait_seconds}s.",
+                )
+
         transition = await session.execute(
             update(GapAnalysis)
             .where(
                 GapAnalysis.id == existing.id,
-                GapAnalysis.status.in_([GapAnalysisStatus.FAILED_LLM, GapAnalysisStatus.FAILED_VALIDATION]),
+                GapAnalysis.status.in_(
+                    [
+                        GapAnalysisStatus.FAILED_LLM,
+                        GapAnalysisStatus.FAILED_VALIDATION,
+                        GapAnalysisStatus.FAILED_TIMEOUT,
+                    ]
+                ),
             )
             .values(status=GapAnalysisStatus.PENDING, error_message=None)
         )
@@ -201,8 +269,8 @@ async def create_or_get_gap_analysis(
         resume_text=normalized_resume,
         jd_text=normalized_jd,
         status=GapAnalysisStatus.PENDING,
-        model=payload.model,
-        prompt_version=f"{payload.prompt_version}:{clean_strategy}",
+        model=(payload.model or settings.llm_model or "requested-default"),
+        prompt_version=f"{(payload.prompt_version or 'v1')}:{clean_strategy}",
     )
     session.add(gap_analysis)
     try:
@@ -234,6 +302,10 @@ async def create_or_get_gap_analysis(
 
 
 async def get_gap_analysis(session: AsyncSession, gap_analysis_id: UUID) -> GapAnalysisOut | None:
+    # Keep polling clients informed: stale PENDING rows are transitioned to FAILED_TIMEOUT.
+    await _sweep_stuck_pending(session)
+    await session.commit()
+
     stmt = (
         select(GapAnalysis)
         .where(GapAnalysis.id == gap_analysis_id)

@@ -71,6 +71,8 @@ class Settings(BaseModel):
     local_llm_base_url: str = os.getenv("LOCAL_LLM_BASE_URL", "http://localhost:11434")
     local_llm_model: str = os.getenv("LOCAL_LLM_MODEL", "llama3.1")
     max_concurrent_gap_jobs: int = int(os.getenv("MAX_CONCURRENT_GAP_JOBS", "4"))
+    pending_timeout_seconds: int = int(os.getenv("PENDING_TIMEOUT_SECONDS", "600"))
+    retry_cooldown_seconds: int = int(os.getenv("RETRY_COOLDOWN_SECONDS", "15"))
     canonical_skills_path: str = os.getenv(
         "CANONICAL_SKILLS_PATH",
         str(_base_dir / "datasets" / "canonical_skills.txt"),

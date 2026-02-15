@@ -8,8 +8,8 @@ from app.core.config import settings
 class GapAnalysisCreate(BaseModel):
     resume_text: str = Field(min_length=1, max_length=settings.max_resume_chars)
     jd_text: str = Field(min_length=1, max_length=settings.max_jd_chars)
-    model: str = Field(min_length=1)
-    prompt_version: str = Field(min_length=1)
+    model: str | None = None
+    prompt_version: str | None = None
 
     @field_validator("resume_text", "jd_text", mode="before")
     @classmethod
@@ -23,7 +23,9 @@ class GapAnalysisCreate(BaseModel):
 
     @field_validator("model", "prompt_version", mode="before")
     @classmethod
-    def _validate_identifiers(cls, v: str) -> str:
+    def _validate_identifiers(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
         if not isinstance(v, str):
             raise ValueError("must be a string")
         cleaned = v.strip()

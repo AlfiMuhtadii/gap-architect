@@ -12,6 +12,7 @@ class GapAnalysisStatus(str, enum.Enum):
     DONE = "DONE"
     FAILED_VALIDATION = "FAILED_VALIDATION"
     FAILED_LLM = "FAILED_LLM"
+    FAILED_TIMEOUT = "FAILED_TIMEOUT"
 
 class LlmRunStatus(str, enum.Enum):
     SUCCESS = "SUCCESS"

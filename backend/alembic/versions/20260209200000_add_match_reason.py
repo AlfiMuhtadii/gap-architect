@@ -17,12 +17,8 @@ depends_on = None
 def upgrade() -> None:
     op.add_column("gap_results", sa.Column("match_reason", sa.Text(), nullable=True))
     op.add_column("gap_results", sa.Column("top_priority_skills", postgresql.JSONB(), nullable=True))
-    op.add_column("gap_results", sa.Column("hard_skills_missing", postgresql.JSONB(), nullable=True))
-    op.add_column("gap_results", sa.Column("soft_skills_missing", postgresql.JSONB(), nullable=True))
-
+ 
 
 def downgrade() -> None:
-    op.drop_column("gap_results", "soft_skills_missing")
-    op.drop_column("gap_results", "hard_skills_missing")
     op.drop_column("gap_results", "top_priority_skills")
     op.drop_column("gap_results", "match_reason")

@@ -4,6 +4,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from app.core import config as config_module
 from app.models.gap import GapAnalysis, GapAnalysisStatus, GapResult, JdCleanRun, LlmRun
 from app.schemas.gap_analysis import GapAnalysisCreate
 from app.services import llm_service
@@ -24,6 +25,7 @@ async def _reset_tables(maker: async_sessionmaker[AsyncSession]) -> None:
 
 @pytest.mark.asyncio
 async def test_retry_transition_atomic_single_winner(engine, monkeypatch):
+    monkeypatch.setattr(config_module.settings, "retry_cooldown_seconds", 0)
     maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     await _reset_tables(maker)
     calls = {"count": 0}

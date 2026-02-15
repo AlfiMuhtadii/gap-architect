@@ -14,6 +14,7 @@ from app.models.gap import GapAnalysis
 from app.services.gap_analysis_ai import run_gap_analysis_ai, LlmProvider
 from app.services.log_sanitize import sanitize_for_log
 from app.services.skill_matcher import match_skills
+from app.services.skill_taxonomy import extract_skills
 
 _INFLIGHT_IDS: set[str] = set()
 _INFLIGHT_GUARD = asyncio.Lock()
@@ -126,16 +127,32 @@ def _build_interview_questions(missing: list[str], jd_text: str) -> list[dict[st
     return questions
 
 
-def _build_roadmap_markdown(missing: list[str], steps: list[dict[str, str]]) -> str:
-    gap_summary = (
-        "The resume covers the core requirements, with only minor gaps."
-        if not missing
-        else (
+def _build_roadmap_markdown(
+    missing: list[str],
+    steps: list[dict[str, str]],
+    *,
+    match_percent: float | None = None,
+) -> str:
+    if not missing:
+        gap_summary = "The resume covers the core requirements, with only minor gaps."
+    elif match_percent is not None and match_percent <= 20:
+        gap_summary = (
+            "The resume currently has low overlap with the JD requirements. "
+            f"Priority gaps include {missing[0]}"
+            + (f" and {missing[1]}." if len(missing) > 1 else ".")
+        )
+    elif match_percent is not None and match_percent <= 50:
+        gap_summary = (
+            "The resume has partial overlap with the JD requirements. "
+            f"Priority gaps include {missing[0]}"
+            + (f" and {missing[1]}." if len(missing) > 1 else ".")
+        )
+    else:
+        gap_summary = (
             "The resume aligns with the role, but several JD skills are missing. "
             f"Priority gaps include {missing[0]}"
             + (f" and {missing[1]}." if len(missing) > 1 else ".")
         )
-    )
     priority = "\n".join([f"- {s}" for s in missing[:3]]) if missing else "- None"
     steps_md = (
         "\n".join(
@@ -314,10 +331,12 @@ class HeuristicProvider:
 
         questions = _build_interview_questions(missing, jd_text)
 
-        roadmap = _build_roadmap_markdown(missing, steps)
+        roadmap = _build_roadmap_markdown(missing, steps, match_percent=match_percent)
 
         return _to_json(
             {
+                "jd_skills_extracted": extract_skills(jd_text),
+                "resume_skills_extracted": extract_skills(resume_text),
                 "missing_skills": missing,
                 "top_priority_skills": top_priority,
                 "action_steps": steps,
@@ -414,8 +433,8 @@ def _build_prompt(
     deterministic_match_reason: str | None = None,
 ) -> str:
     """
-    Deterministic, token-efficient, validator-friendly prompt.
-    Designed to minimize retries and malformed JSON.
+    Deterministic-boundary, validator-friendly prompt with structured AI extraction      
+    traces, designed to minimize malformed JSON and keep final decisions deterministic.
     """
     prompt = (
         "You are performing a precise Resume Job Description gap analysis.\n\n"
@@ -425,6 +444,8 @@ def _build_prompt(
         "If the text is short, assume every word may be relevant.\n\n"
         "Return ONLY valid JSON with this exact schema:\n"
         "{"
+        "\"jd_skills_extracted\": [\"string\"], "
+        "\"resume_skills_extracted\": [\"string\"], "
         "\"missing_skills\": [\"string\"], "
         "\"action_steps\": [{\"title\":\"\",\"why\":\"\",\"deliverable\":\"\"}, ... exactly 3], "
         "\"interview_questions\": [{\"question\":\"\",\"focus_gap\":\"\",\"what_good_looks_like\":\"\"}, ... exactly 3], "
@@ -434,9 +455,10 @@ def _build_prompt(
         "}\n\n"
 
         "Core rules:\n"
-        "- missing_skills = skills in JD but not in Resume.\n"
-        "- Extract only missing technical skills explicitly mentioned in the provided JD.\n"
-        "- If the resume already covers a skill, DO NOT include it in missing_skills.\n"
+        "- Extract skill candidates from JD and Resume into jd_skills_extracted and resume_skills_extracted.\n"
+        "- jd_skills_extracted and resume_skills_extracted are extraction traces only.\n"
+        "- missing_skills MUST exactly match DETERMINISTIC_GAP_INPUT.missing_skills.\n"
+        "- Keep extraction traces focused on explicit technical skills mentioned in JD/Resume.\n"
         "- match_percent = percentage overlap of JD skills found in Resume (0-100).\n"
         "- match_reason = 1 concise sentence explaining the calculation basis.\n"
         "- action_steps and interview_questions MUST contain exactly 3 items.\n"
@@ -470,8 +492,7 @@ def _build_prompt(
         "- No extra sections.\n"
         "- Deterministic heading order required.\n"
         "- Output MUST be valid JSON only.\n\n"
-        "- Use DETERMINISTIC_GAP_INPUT as source of truth for missing_skills, match_percent, and match_reason.\n"
-        "- Do not add or remove missing skills outside DETERMINISTIC_GAP_INPUT.\n\n"
+        "- Use DETERMINISTIC_GAP_INPUT as source of truth for missing_skills, match_percent, and match_reason.\n\n"
 
         f"RESUME_TEXT:\n{resume_text}\n\n"
         f"JD_TEXT:\n{jd_text}\n\n"

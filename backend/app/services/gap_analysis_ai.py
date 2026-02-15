@@ -17,6 +17,7 @@ from app.models.gap import GapAnalysis, GapAnalysisStatus, GapResult, LlmRun, Ll
 from app.core.config import settings
 from app.services.log_sanitize import sanitize_for_log
 from app.services.skill_matcher import match_skills
+from app.services.skill_taxonomy import extract_skills, get_skill_taxonomy_map, normalize_skill_text
 
 logger = logging.getLogger("app.gap_analysis_ai")
 
@@ -57,6 +58,8 @@ class InterviewQuestion(BaseModel):
 
 
 class GapAnalysisAIResult(BaseModel):
+    jd_skills_extracted: list[str] = Field(default_factory=list)
+    resume_skills_extracted: list[str] = Field(default_factory=list)
     missing_skills: list[str]
     top_priority_skills: list[str] = Field(default_factory=list)
     action_steps: conlist(ActionStep, min_length=3, max_length=3)
@@ -103,7 +106,10 @@ class GapAnalysisAIResult(BaseModel):
 
 
 class LlmCallError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, duration_ms: int = 0, attempts: int = 1) -> None:
+        super().__init__(message)
+        self.duration_ms = duration_ms
+        self.attempts = attempts
 
 
 def _flatten_exception_messages(exc: BaseException) -> list[str]:
@@ -374,6 +380,8 @@ def _coerce_local_payload(parsed: dict[str, Any]) -> None:
         parsed[name] = _to_str_list(parsed.get(name))
 
     _ensure_list("top_priority_skills")
+    _ensure_list("jd_skills_extracted")
+    _ensure_list("resume_skills_extracted")
 
     steps = parsed.get("action_steps")
     if not isinstance(steps, list):
@@ -540,6 +548,8 @@ def _repair_prompt(base_prompt: str, raw_response: str, error: str) -> str:
         f"Validation error: {error}\n\n"
         "Return ONLY valid JSON with this exact schema:\n"
         "{"
+        "\"jd_skills_extracted\": [\"string\"], "
+        "\"resume_skills_extracted\": [\"string\"], "
         "\"missing_skills\": [\"string\"], "
         "\"top_priority_skills\": [\"string\"], "
         "\"action_steps\": [{\"title\":\"\",\"why\":\"\",\"deliverable\":\"\"}, ... x3], "
@@ -682,7 +692,7 @@ async def run_gap_analysis_ai(
                     continue
                 duration_ms = int((time.perf_counter() - start) * 1000)
                 error_text = _exception_summary(exc)
-                raise LlmCallError(error_text) from exc
+                raise LlmCallError(error_text, duration_ms=duration_ms, attempts=attempts) from exc
 
         duration_ms = int((time.perf_counter() - start) * 1000)
         try:
@@ -835,7 +845,7 @@ async def run_gap_analysis_ai(
             return
     except LlmCallError as exc:
         meta = {
-            "retry_attempts": 2 if "timeout" in (str(exc) or "").lower() else 1,
+            "retry_attempts": max(getattr(exc, "attempts", 1), 1),
             "fallback_from": fallback_from,
         }
         await _log_llm_run(
@@ -847,8 +857,10 @@ async def run_gap_analysis_ai(
             response_json={"error": str(exc) or "llm_failed", "_meta": meta},
             status=LlmRunStatus.FAILED,
             error_message=str(exc) or "llm_failed",
-            duration_ms=0,
+            duration_ms=max(getattr(exc, "duration_ms", 0), 0),
         )
+        # Persist failed layer run before bubbling to fallback chain.
+        await session.commit()
         if "rate_limited" in str(exc):
             raise ValueError("rate_limited") from exc
         if getattr(provider, "name", "") == "local_llm":
@@ -871,19 +883,145 @@ async def _persist_success(
     result: GapAnalysisAIResult,
     provider: LlmProvider,
 ) -> bool:
-    matcher_missing, match_percent, match_reason, top = match_skills(
-        resume_text=analysis.resume_text,
-        jd_text=analysis.jd_text,
-    )
-    # Deterministic source of truth for gap math + missing skill list.
-    # LLM remains generative-only (steps/questions/roadmap).
-    missing = matcher_missing
-    use_matcher = getattr(provider, "name", "") == "heuristic"
-    if getattr(provider, "name", "") != "heuristic":
-        # Keep LLM priority suggestions when present, fallback to matcher top.
-        top = result.top_priority_skills or top
+    def _canonicalize_skills(skills: list[str]) -> list[str]:
+        mapping = get_skill_taxonomy_map()
+        out: list[str] = []
+        seen: set[str] = set()
+        for raw in skills:
+            text = str(raw).strip()
+            if not text:
+                continue
+            norm = normalize_skill_text(text)
+            if not norm:
+                continue
+            canonical = mapping.get(norm) or mapping.get(norm.replace(" ", "")) or text
+            canonical_norm = normalize_skill_text(canonical)
+            if not canonical_norm or canonical_norm in seen:
+                continue
+            seen.add(canonical_norm)
+            out.append(canonical)
+        return out
 
-    if use_matcher:
+    def _normalize_source_text(text: str) -> str:
+        # Use the same canonical normalizer as skill keys so hyphen/dot variants
+        # (e.g. event-driven, domain-driven, node.js) are matched consistently.
+        return normalize_skill_text(text)
+
+    def _contains_phrase(source_norm: str, phrase_norm: str) -> bool:
+        phrase = phrase_norm.strip()
+        if not phrase:
+            return False
+        hay = f" {source_norm} "
+        needle = f" {phrase} "
+        return needle in hay
+
+    def _verify_ai_skills(skills: list[str], source_text: str) -> list[str]:
+        """
+        AI propose -> deterministic verify:
+        - canonical must exist in taxonomy
+        - candidate must have literal evidence in source text
+        """
+        mapping = get_skill_taxonomy_map()
+        source_norm = _normalize_source_text(source_text)
+        out: list[str] = []
+        seen: set[str] = set()
+
+        for raw in skills:
+            text = str(raw).strip()
+            if not text:
+                continue
+            raw_norm = normalize_skill_text(text)
+            if not raw_norm:
+                continue
+            canonical = mapping.get(raw_norm) or mapping.get(raw_norm.replace(" ", ""))
+            if not canonical:
+                continue
+            canonical_norm = normalize_skill_text(canonical)
+            if not canonical_norm:
+                continue
+
+            # Accept only if the original mention OR canonical phrase exists in source.
+            if not (_contains_phrase(source_norm, raw_norm) or _contains_phrase(source_norm, canonical_norm)):
+                continue
+
+            if canonical_norm in seen:
+                continue
+            seen.add(canonical_norm)
+            out.append(canonical)
+        return out
+
+    def _collapse_overlapping(skills: list[str]) -> list[str]:
+        """
+        Remove broader/sub-skill duplicates when a more specific phrase exists.
+        Example: ruby + rails + ruby on rails -> keep ruby on rails.
+        """
+        deduped: list[str] = []
+        seen_norm: set[str] = set()
+        for item in skills:
+            norm = normalize_skill_text(item)
+            if not norm or norm in seen_norm:
+                continue
+            seen_norm.add(norm)
+            deduped.append(item)
+
+        normalized_items = [(item, normalize_skill_text(item).split()) for item in deduped]
+        final_items: list[str] = []
+        for item, tokens in normalized_items:
+            if not tokens:
+                continue
+            token_set = set(tokens)
+            is_subset = False
+            for other, other_tokens in normalized_items:
+                if item == other:
+                    continue
+                if len(other_tokens) <= len(tokens):
+                    continue
+                if token_set.issubset(set(other_tokens)):
+                    is_subset = True
+                    break
+            if not is_subset:
+                final_items.append(item)
+        return final_items
+
+    # Hybrid source:
+    # - deterministic baseline guarantees explicit-text recall
+    # - AI extraction (verified) adds compliant semantic recall
+    jd_det = _canonicalize_skills(extract_skills(analysis.jd_text))
+    resume_det = _canonicalize_skills(extract_skills(analysis.resume_text))
+    jd_ai_verified = _verify_ai_skills(result.jd_skills_extracted, analysis.jd_text)
+    resume_ai_verified = _verify_ai_skills(result.resume_skills_extracted, analysis.resume_text)
+
+    final_jd = _collapse_overlapping(jd_det + jd_ai_verified)
+    final_resume = _collapse_overlapping(resume_det + resume_ai_verified)
+    no_requirements_mode = len(final_jd) == 0
+
+    if not no_requirements_mode:
+        resume_norm = {normalize_skill_text(s) for s in final_resume}
+        missing = [s for s in final_jd if normalize_skill_text(s) not in resume_norm]
+        total = max(len(final_jd), 1)
+        matched = max(total - len(missing), 0)
+        match_percent = round((matched / total) * 100, 2)
+        match_reason = f"Deterministic diff from normalized skill sets: matched {matched} of {total} JD skills."
+        top = missing[:3]
+    else:
+        missing = []
+        top = []
+        match_percent = 100.0
+        match_reason = "No identifiable technical requirements found in JD; gap analysis guidance is skipped."
+    use_matcher = getattr(provider, "name", "") == "heuristic"
+    if not no_requirements_mode and getattr(provider, "name", "") != "heuristic":
+        # Keep only priority skills that exist in current missing set.
+        missing_norm = {normalize_skill_text(s) for s in missing}
+        filtered_top = [
+            s for s in (result.top_priority_skills or [])
+            if normalize_skill_text(str(s)) in missing_norm
+        ]
+        top = filtered_top[:3] if filtered_top else top
+
+    if no_requirements_mode:
+        action_steps = []
+        interview_questions = []
+    elif use_matcher:
         ranked = await _rank_missing_skills(session, missing, analysis.jd_text)
         missing_for_steps = ranked if ranked else (missing[:3] if missing else [])
 
@@ -893,7 +1031,7 @@ async def _persist_success(
         action_steps = result.action_steps if isinstance(result.action_steps, list) else []
         interview_questions = result.interview_questions
 
-    if not action_steps:
+    if not no_requirements_mode and not action_steps:
         action_steps = _fallback_action_steps(missing)
 
     def _steps_to_dicts(steps: list[Any]) -> list[dict[str, str]]:
@@ -943,9 +1081,9 @@ async def _persist_success(
     action_steps = _steps_to_dicts(action_steps)
     interview_questions = _questions_to_dicts(interview_questions)
 
-    if len(action_steps) != 3:
+    if not no_requirements_mode and len(action_steps) != 3:
         action_steps = _fallback_action_steps(missing)
-    if len(interview_questions) != 3:
+    if not no_requirements_mode and len(interview_questions) != 3:
         interview_questions = _fallback_interview_questions(missing)
 
     def _step_to_dict(step: Any) -> dict[str, str]:
@@ -963,18 +1101,32 @@ async def _persist_success(
             }
         return {"title": "", "why": "", "deliverable": ""}
 
-    generated_roadmap = "\n".join(
-        [
-            f"{i+1}. **{_step_to_dict(step)['title']}**\n   - Why: {_step_to_dict(step)['why']}\n   - Deliverable: {_step_to_dict(step)['deliverable']}"
-            for i, step in enumerate(action_steps)
-        ]
-    )
-    roadmap_markdown = result.roadmap_markdown
-    if not roadmap_markdown:
-        roadmap_markdown = generated_roadmap
+    if no_requirements_mode:
+        roadmap_markdown = (
+            "## Gap Summary\n"
+            "Job description does not contain identifiable technical requirements.\n\n"
+            "## Priority Skills to Learn\n"
+            "- None\n\n"
+            "## Concrete Steps\n"
+            "No guidance generated because no technical requirements were detected.\n\n"
+            "## Expected Outcomes / Readiness\n"
+            "- Provide a JD with explicit technical requirements for precise gap analysis.\n\n"
+            "## Suggested Learning Order\n"
+            "1. None"
+        )
     else:
-        if len(action_steps) >= 1:
-            roadmap_markdown = _inject_steps_into_roadmap(roadmap_markdown, action_steps)
+        generated_roadmap = "\n".join(
+            [
+                f"{i+1}. **{_step_to_dict(step)['title']}**\n   - Why: {_step_to_dict(step)['why']}\n   - Deliverable: {_step_to_dict(step)['deliverable']}"
+                for i, step in enumerate(action_steps)
+            ]
+        )
+        roadmap_markdown = result.roadmap_markdown
+        if not roadmap_markdown:
+            roadmap_markdown = generated_roadmap
+        else:
+            if len(action_steps) >= 1:
+                roadmap_markdown = _inject_steps_into_roadmap(roadmap_markdown, action_steps)
 
     gap_result = GapResult(
         gap_analysis_id=analysis.id,

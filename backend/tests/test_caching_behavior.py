@@ -1,9 +1,9 @@
 import pytest
+from uuid import UUID
 from sqlalchemy import select
 
 from app.models.gap import GapAnalysis, GapAnalysisStatus
 from app.services import llm_service
-from app.services.gap_analysis_service import _fingerprint, _normalize_text
 from .factories import GapAnalysisPayloadFactory, make_gap_result
 
 
@@ -22,8 +22,9 @@ async def test_caching_behavior(client, db_session, monkeypatch):
     body1 = res1.json()
     assert body1["status"] == "PENDING"
 
-    fp = _fingerprint(_normalize_text(payload["resume_text"]), _normalize_text(payload["jd_text"]))
-    analysis = (await db_session.execute(select(GapAnalysis).where(GapAnalysis.fingerprint == fp))).scalars().first()
+    analysis = (
+        await db_session.execute(select(GapAnalysis).where(GapAnalysis.id == UUID(body1["id"])))
+    ).scalars().first()
     analysis.status = GapAnalysisStatus.DONE
     db_session.add(make_gap_result(analysis.id))
     await db_session.commit()

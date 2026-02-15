@@ -109,6 +109,16 @@ _MERGE_TOKEN_BIGRAMS = {
     ("node", "js"): "nodejs",
     ("next", "js"): "nextjs",
 }
+_TOKEN_SYNONYMS = {
+    "golang": "go",
+    "js": "javascript",
+    "ts": "typescript",
+    "py": "python",
+    "k8s": "kubernetes",
+    "tf": "terraform",
+    "pg": "postgresql",
+    "psql": "postgresql",
+}
 
 
 def _canonical_token(token: str) -> str:
@@ -126,6 +136,7 @@ def _canonical_token(token: str) -> str:
         return "c++"
     if t == "fsharp":
         return "f#"
+    t = _TOKEN_SYNONYMS.get(t, t)
     return t
 
 

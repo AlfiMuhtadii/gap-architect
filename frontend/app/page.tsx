@@ -19,7 +19,7 @@ type GapResult = {
 
 type GapAnalysisResponse = {
   id: string;
-  status: "PENDING" | "DONE" | "FAILED_VALIDATION" | "FAILED_LLM";
+  status: "PENDING" | "DONE" | "FAILED_VALIDATION" | "FAILED_LLM" | "FAILED_TIMEOUT";
   error_message?: string | null;
   result?: GapResult | null;
 };
@@ -32,9 +32,6 @@ type InputValidationResponse = {
   resume_tech_entities: number;
   jd_tech_entities: number;
 };
-
-const DEFAULT_MODEL = "gpt-4o-mini";
-const DEFAULT_PROMPT_VERSION = "v1";
 
 function toUserMessage(error: unknown, fallback: string): string {
   const raw = error instanceof Error ? error.message : "";
@@ -56,22 +53,6 @@ function countWords(text: string): number {
   return (text.match(/\b\w+\b/g) ?? []).length;
 }
 
-function countTechEntities(text: string): number {
-  const terms = [
-    "python","java","javascript","typescript","golang","go","rust","kotlin","scala",
-    "sql","postgresql","mysql","mongodb","redis","docker","kubernetes","aws","gcp","azure",
-    "react","next.js","nextjs","node.js","nodejs","fastapi","django","flask","spring","terraform"
-  ];
-  const lowered = text.toLowerCase();
-  const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const found = new Set<string>();
-  for (const term of terms) {
-    const pattern = new RegExp(`(?<![a-z0-9])${esc(term)}(?![a-z0-9])`, "i");
-    if (pattern.test(lowered)) found.add(term);
-  }
-  return found.size;
-}
-
 export default function HomePage() {
   const [resumeText, setResumeText] = useState("");
   const [jdText, setJdText] = useState("");
@@ -83,13 +64,18 @@ export default function HomePage() {
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [validation, setValidation] = useState<InputValidationResponse | null>(null);
   const [validationError, setValidationError] = useState<string | null>(null);
+  const [showPendingHint, setShowPendingHint] = useState(false);
+  const [pollingUnavailable, setPollingUnavailable] = useState(false);
   const canSubmit = Boolean(resumeText.trim() && jdText.trim() && validation?.is_valid);
 
   const fetchStatus = useCallback(async (id: string) => {
     const data = await apiGet<GapAnalysisResponse>(`/api/v1/gap-analyses/${id}`);
     setStatus(data.status);
     setResult(data.result ?? null);
-    if ((data.status === "FAILED_VALIDATION" || data.status === "FAILED_LLM") && data.error_message) {
+    setPollingUnavailable(false);
+    if (data.status === "FAILED_TIMEOUT") {
+      setError(data.error_message || "Analysis timed out. Please retry.");
+    } else if ((data.status === "FAILED_VALIDATION" || data.status === "FAILED_LLM") && data.error_message) {
       setError(data.error_message);
     }
     return data.status;
@@ -103,11 +89,21 @@ export default function HomePage() {
         if (s !== "PENDING") clearInterval(timer);
       } catch (e) {
         setError(toUserMessage(e, "Failed to fetch analysis status."));
+        setPollingUnavailable(true);
         clearInterval(timer);
       }
     }, 1500);
     return () => clearInterval(timer);
   }, [analysisId, status, fetchStatus]);
+
+  useEffect(() => {
+    if (status !== "PENDING") {
+      setShowPendingHint(false);
+      return;
+    }
+    const timer = setTimeout(() => setShowPendingHint(true), 45000);
+    return () => clearTimeout(timer);
+  }, [status]);
 
   useEffect(() => {
     if (!resumeText.trim() || !jdText.trim()) {
@@ -132,6 +128,9 @@ export default function HomePage() {
   }, [resumeText, jdText]);
 
   const onSubmit = async () => {
+    setIsSubmitting(true);
+    setStatus(null);
+    setPollingUnavailable(false);
     let gate: InputValidationResponse;
     try {
       gate = await apiPost<InputValidationResponse>("/api/v1/gap-analyses/validate-input", {
@@ -143,32 +142,33 @@ export default function HomePage() {
     } catch (e) {
       setValidation(null);
       setValidationError(toUserMessage(e, "Unable to validate input right now. Please retry."));
+      setIsSubmitting(false);
       return;
     }
     if (!gate.is_valid) {
       setError(gate.error_message ?? "Input validation failed");
+      setIsSubmitting(false);
       return;
     }
     setError(null);
     setResult(null);
     setStatus(null);
-    setIsSubmitting(true);
     try {
       const data = await apiPost<GapAnalysisResponse>("/api/v1/gap-analyses", {
         resume_text: resumeText,
-        jd_text: jdText,
-        model: DEFAULT_MODEL,
-        prompt_version: DEFAULT_PROMPT_VERSION
+        jd_text: jdText
       });
       setAnalysisId(data.id);
       setStatus(data.status);
       setResult(data.result ?? null);
-      if ((data.status === "FAILED_VALIDATION" || data.status === "FAILED_LLM") && data.error_message) {
+      if (data.status === "FAILED_TIMEOUT") {
+        setError(data.error_message || "Analysis timed out. Please retry.");
+      } else if ((data.status === "FAILED_VALIDATION" || data.status === "FAILED_LLM") && data.error_message) {
         setError(data.error_message);
       }
-      setIsSubmitting(false);
     } catch (e) {
       setError(toUserMessage(e, "Submission failed. Please retry."));
+    } finally {
       setIsSubmitting(false);
     }
   };
@@ -176,16 +176,38 @@ export default function HomePage() {
   const onLookup = async () => {
     setError(null);
     if (!lookupId.trim()) return;
+    setPollingUnavailable(false);
     try {
       const data = await apiGet<GapAnalysisResponse>(`/api/v1/gap-analyses/${lookupId.trim()}`);
       setAnalysisId(data.id);
       setStatus(data.status);
       setResult(data.result ?? null);
-      if ((data.status === "FAILED_VALIDATION" || data.status === "FAILED_LLM") && data.error_message) {
+      if (data.status === "FAILED_TIMEOUT") {
+        setError(data.error_message || "Analysis timed out. Please retry.");
+      } else if ((data.status === "FAILED_VALIDATION" || data.status === "FAILED_LLM") && data.error_message) {
         setError(data.error_message);
       }
     } catch (e) {
       setError(toUserMessage(e, "Analysis ID not found."));
+    }
+  };
+
+  const onRetryStatusCheck = async () => {
+    if (!analysisId) return;
+    setError(null);
+    try {
+      const data = await apiGet<GapAnalysisResponse>(`/api/v1/gap-analyses/${analysisId}`);
+      setStatus(data.status);
+      setResult(data.result ?? null);
+      setPollingUnavailable(false);
+      if (data.status === "FAILED_TIMEOUT") {
+        setError(data.error_message || "Analysis timed out.");
+      } else if ((data.status === "FAILED_VALIDATION" || data.status === "FAILED_LLM") && data.error_message) {
+        setError(data.error_message);
+      }
+    } catch (e) {
+      setError(toUserMessage(e, "Failed to fetch analysis status."));
+      setPollingUnavailable(true);
     }
   };
 
@@ -350,7 +372,7 @@ export default function HomePage() {
                 placeholder="Paste resume here..."
               />
               <p className={`text-xs ${validation?.is_valid === false ? "text-[var(--danger)]" : "text-[var(--text-muted)]"}`}>
-                Word count: {validation?.resume_word_count ?? countWords(resumeText)} | Tech entities: {validation?.resume_tech_entities ?? countTechEntities(resumeText)}
+                Word count: {validation?.resume_word_count ?? countWords(resumeText)} | Skill entities: {validation?.resume_tech_entities ?? "..."}
               </p>
             </div>
           </div>
@@ -364,7 +386,7 @@ export default function HomePage() {
                 placeholder="Paste job description here..."
               />
               <p className={`text-xs ${validation?.is_valid === false ? "text-[var(--danger)]" : "text-[var(--text-muted)]"}`}>
-                Word count: {validation?.jd_word_count ?? countWords(jdText)} | Tech entities: {validation?.jd_tech_entities ?? countTechEntities(jdText)}
+                Word count: {validation?.jd_word_count ?? countWords(jdText)} | Skill entities: {validation?.jd_tech_entities ?? "..."}
               </p>
             </div>
           </div>
@@ -386,7 +408,15 @@ export default function HomePage() {
             onClick={onSubmit}
             disabled={!canSubmit || isSubmitting || status === "PENDING"}
           >
-            {status === "PENDING" ? "Processing..." : isSubmitting ? "Submitting..." : "Run Gap Analysis"}
+            {isSubmitting
+              ? "Submitting..."
+              : status === "PENDING" && pollingUnavailable
+                ? "Processing (Server unreachable)"
+                : status === "PENDING"
+                  ? "Processing..."
+                  : status && status.startsWith("FAILED")
+                    ? "Re-run Analysis"
+                    : "Run Gap Analysis"}
           </button>
           {analysisId && (
             <span className="text-xs text-[var(--text-muted)]">Analysis ID: {analysisId}</span>
@@ -395,6 +425,11 @@ export default function HomePage() {
             <span className="text-xs font-semibold text-[var(--text)]">Status: {status}</span>
           )}
         </div>
+        {showPendingHint && (
+          <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-800">
+            Analysis is taking longer than usual. You can wait, or retry if this continues.
+          </div>
+        )}
 
         <div className="mt-4 rounded-2xl border border-[var(--border)] bg-white/80 p-5 shadow-sm backdrop-blur">
           <div className="flex flex-wrap items-center gap-3">
@@ -416,6 +451,21 @@ export default function HomePage() {
         {error && (
           <div className="mt-4 rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm font-medium text-red-700">
             {error}
+          </div>
+        )}
+        {pollingUnavailable && status === "PENDING" && analysisId && (
+          <div className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-medium text-amber-800">
+            <div>Server unavailable. Your analysis is safe.</div>
+            <div className="mt-1">Retry status check when the server is back.</div>
+            <div className="mt-3">
+              <button
+                className="rounded-xl border border-[var(--border)] bg-white px-4 py-2 text-sm font-semibold text-[var(--text)]"
+                onClick={onRetryStatusCheck}
+                disabled={isSubmitting}
+              >
+                Retry Status Check
+              </button>
+            </div>
           </div>
         )}
       </section>

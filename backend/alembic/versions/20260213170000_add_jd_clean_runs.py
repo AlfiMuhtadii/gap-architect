@@ -1,7 +1,7 @@
 """add jd_clean_runs metadata table
 
 Revision ID: 20260213170000
-Revises: 20260209203000
+Revises: 20260209200000
 Create Date: 2026-02-13 17:00:00
 """
 
@@ -11,7 +11,7 @@ from sqlalchemy.dialects import postgresql
 
 
 revision = "20260213170000"
-down_revision = "20260209203000"
+down_revision = "20260209200000"
 branch_labels = None
 depends_on = None
 

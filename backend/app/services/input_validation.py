@@ -2,29 +2,23 @@ from __future__ import annotations
 
 from app.schemas.gap_analysis import InputValidationResponse
 from app.services.jd_clipping import clip_job_description
-from app.services.skill_taxonomy import extract_skills
+from app.services.skill_taxonomy import extract_skills, normalize_skill_text
 from app.services.text_processing import normalize_text, word_count
 
 MIN_WORDS = 50
-MIN_TECH_ENTITIES = 5
 MAX_VALIDATION_ERROR_MESSAGE_CHARS = 300
-
-
-def tech_entity_count(text: str) -> int:
-    # Count unique canonical skills detected by taxonomy matcher.
-    # This avoids partial string false-positives such as "go" in "mago" or "aws" in "paws".
-    found = {s.lower() for s in extract_skills(text)}
-    return len(found)
 
 
 def validate_input_quality_raw(resume_text: str, jd_text: str) -> InputValidationResponse:
     resume_words = word_count(resume_text)
     jd_words = word_count(jd_text)
-    resume_tech = tech_entity_count(resume_text)
-    jd_tech = tech_entity_count(jd_text)
+    resume_skills = {normalize_skill_text(s) for s in extract_skills(resume_text) if normalize_skill_text(s)}
+    jd_skills = {normalize_skill_text(s) for s in extract_skills(jd_text) if normalize_skill_text(s)}
+    resume_tech = len(resume_skills)
+    jd_tech = len(jd_skills)
 
-    resume_valid = resume_words >= MIN_WORDS or resume_tech >= MIN_TECH_ENTITIES
-    jd_valid = jd_words >= MIN_WORDS or jd_tech >= MIN_TECH_ENTITIES
+    resume_valid = resume_words >= MIN_WORDS
+    jd_valid = jd_words >= MIN_WORDS
 
     error_message: str | None = None
     if not resume_valid or not jd_valid:

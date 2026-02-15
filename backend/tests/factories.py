@@ -10,13 +10,17 @@ class GapAnalysisPayloadFactory:
         "Senior engineer with eight years building backend services using Python, FastAPI, "
         "PostgreSQL, Docker, Kubernetes, AWS, CI/CD, monitoring, and testing. "
         "Led migration projects, designed APIs, improved reliability, mentored teammates, "
-        "collaborated with product and design, and delivered production systems with measurable impact."
+        "collaborated with product and design, and delivered production systems with measurable impact. "
+        "Comfortable with incident management, on-call rotation, documentation, code reviews, "
+        "and iterative delivery in agile teams."
     )
     jd_text: str = (
         "We are looking for a backend engineer to build API services with Python, SQL, AWS, "
         "Docker, Kubernetes, observability, security, testing, and scalable architecture. "
         "Candidates should collaborate cross-functionally, write clean code, review pull requests, "
-        "own incident response, and deliver reliable production features."
+        "own incident response, and deliver reliable production features. "
+        "The role includes sprint planning, technical documentation, mentoring, and continuous "
+        "improvement of system reliability and developer experience."
     )
     model: str = "gpt-test"
     prompt_version: str = "v1"
